@@ -345,6 +345,13 @@ add_custom_target(lang_header ALL
     DEPENDS ${LANG_HEADER}
 )
 
+# Ensure the language header is generated before any component source is
+# compiled. `idf.py clean` deletes ${LANG_HEADER} (it is a custom-command
+# OUTPUT), so without this ordering a parallel build races and the main
+# sources can compile before lang_header regenerates it, failing with
+# "assets/lang_config.h: No such file or directory".
+add_dependencies(${COMPONENT_LIB} lang_header)
+
 # Find ESP-SR component dynamically
 find_component_by_pattern("espressif__esp-sr" ESP_SR_COMPONENT ESP_SR_COMPONENT_PATH)
 if(ESP_SR_COMPONENT_PATH)
@@ -512,6 +519,12 @@ if ("${size}" AND "${offset}")
         # Build default assets based on configuration
         build_default_assets_bin()
         esptool_py_flash_to_partition(flash "assets" "${GENERATED_ASSETS_LOCAL_FILE}")
+        # Tie asset generation to the component so it is built whenever the app
+        # is. `idf.py clean flash` builds the `flash` target (not the full `all`)
+        # and clean deletes the prior generated_assets.bin, so without this the
+        # standalone `generated_default_assets ALL` target is skipped and flash
+        # fails with "No such file or directory: 'generated_assets.bin'".
+        add_dependencies(${COMPONENT_LIB} generated_default_assets)
         message(STATUS "Generated default assets flash configured: ${GENERATED_ASSETS_LOCAL_FILE} -> assets partition")
     elseif(CONFIG_FLASH_CUSTOM_ASSETS)
         # Flash custom assets
