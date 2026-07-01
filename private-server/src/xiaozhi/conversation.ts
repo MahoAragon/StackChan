@@ -186,6 +186,8 @@ export class ConversationSession {
   private async runTurn(pcm: Buffer): Promise<void> {
     const turn = ++this.turnId;
     this.speaking = true;
+    // Discard any downstream remainder left over from a prior/aborted turn.
+    this.codec.resetDownstream();
 
     try {
       const wav = pcm16ToWav(pcm, SAMPLE_RATE_IN);
@@ -239,6 +241,10 @@ export class ConversationSession {
         this.sendBinary(packet);
       }
     }
+    // Emit this sentence's trailing partial frame so nothing is dropped and the
+    // next sentence starts on a clean frame boundary.
+    if (this.isStale(turn)) return;
+    for (const packet of this.codec.flushDownstream()) this.sendBinary(packet);
   }
 
   /* ------------------------------ Helpers ------------------------------- */

@@ -36,27 +36,57 @@ export class AudioCodec {
     OpusScript.Application.AUDIO,
   );
 
+  /** Carry-over PCM (< one frame) between downstream chunks. */
+  private downstreamResidual = Buffer.alloc(0);
+
   /** Decode one upstream Opus packet -> PCM16 mono 16k for that 60 ms frame. */
   decodeUpstreamPacket(opus: Buffer): Buffer {
     return this.decoder.decode(opus);
   }
 
   /**
-   * Split 24k PCM16 mono audio into 1440-sample (2880-byte) frames and Opus-encode
-   * each. The final short frame is zero-padded (silence) to a full frame so the
-   * encoder always receives an exact frame size.
+   * Encode a chunk of the *continuous* downstream 24k PCM16 stream into whole
+   * 60 ms (1440-sample / 2880-byte) Opus frames. TTS delivers arbitrary chunk
+   * sizes whose boundaries may split a sample or a frame, so we accumulate a
+   * residual and only emit complete, sample-aligned frames — carrying the tail
+   * to the next call. Encoding per-chunk with padding instead would misalign
+   * samples and inject silence, producing static/garbled playback.
+   *
+   * Call flushDownstream() at end-of-stream to emit the final partial frame.
    */
   encodeDownstreamPcm(pcm24k: Buffer): Buffer[] {
+    const buf =
+      this.downstreamResidual.length > 0
+        ? Buffer.concat([this.downstreamResidual, pcm24k])
+        : pcm24k;
+
     const packets: Buffer[] = [];
-    for (let offset = 0; offset < pcm24k.length; offset += FRAME_BYTES_OUT) {
-      let frame = pcm24k.subarray(offset, offset + FRAME_BYTES_OUT);
-      if (frame.length < FRAME_BYTES_OUT) {
-        const padded = Buffer.alloc(FRAME_BYTES_OUT); // zero-filled = silence
-        frame.copy(padded);
-        frame = padded;
-      }
-      packets.push(this.encoder.encode(frame, FRAME_SAMPLES_OUT));
+    let offset = 0;
+    for (; offset + FRAME_BYTES_OUT <= buf.length; offset += FRAME_BYTES_OUT) {
+      packets.push(
+        this.encoder.encode(
+          buf.subarray(offset, offset + FRAME_BYTES_OUT),
+          FRAME_SAMPLES_OUT,
+        ),
+      );
     }
+    // Copy the tail (buf may be reused/GC'd) to prepend next time.
+    this.downstreamResidual =
+      offset < buf.length ? Buffer.from(buf.subarray(offset)) : Buffer.alloc(0);
     return packets;
+  }
+
+  /** Emit any buffered remainder as a final zero-padded frame (end of stream). */
+  flushDownstream(): Buffer[] {
+    if (this.downstreamResidual.length === 0) return [];
+    const frame = Buffer.alloc(FRAME_BYTES_OUT); // zero-filled = silence
+    this.downstreamResidual.copy(frame);
+    this.downstreamResidual = Buffer.alloc(0);
+    return [this.encoder.encode(frame, FRAME_SAMPLES_OUT)];
+  }
+
+  /** Drop any buffered downstream remainder (e.g. when a turn is aborted). */
+  resetDownstream(): void {
+    this.downstreamResidual = Buffer.alloc(0);
   }
 }
