@@ -213,6 +213,13 @@ private:
     {
         _mqtt.reset();
 
+        // StackChan: hard-isolation to private-server. Never dial the M5Stack
+        // EzData cloud (HTTP token endpoint ezdata2.m5stack.com + MQTT broker
+        // uiflow2.m5stack.com). Leave _mqtt null so update()/sendPacket() are
+        // no-ops and callers keep compiling/running.
+        _last_reconnect_attempt = GetHAL().millis();
+        return;
+
         _token = _get_device_token();
         if (_token.empty()) {
             ESP_LOGE(_tag.c_str(), "failed to get device token");

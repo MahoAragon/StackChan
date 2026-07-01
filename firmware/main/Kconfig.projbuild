@@ -15,7 +15,11 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://api.tenclass.net/xiaozhi/ota/"
+    # StackChan: hard-isolation to private-server (was api.tenclass.net).
+    # The real URL is injected at build time via sdkconfig.defaults.local,
+    # generated from the git-ignored repo-root .env (see justfile). An empty
+    # value fails the build (static_assert in xiaozhi-esp32/main/ota.cc).
+    default ""
     help
         The application will access this URL to check for new firmwares and server address.
 

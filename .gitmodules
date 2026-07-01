@@ -1,0 +1,4 @@
+[submodule "firmware/xiaozhi-esp32"]
+	path = firmware/xiaozhi-esp32
+	url = https://github.com/MahoAragon/xiaozhi-esp32.git
+	branch = custom
