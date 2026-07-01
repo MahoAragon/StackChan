@@ -16,6 +16,10 @@
  * {"type":"tts","state":"stop"} because the firmware only decodes opus while it
  * is in the Speaking state. Errors are caught so a turn can never leave the
  * device stuck without a tts stop.
+ *
+ * Downstream frames are paced to real time (TTS_PREBUFFER_MS): the device's
+ * decode queue is tiny and drops packets when full, so sending as fast as TTS
+ * encodes would truncate every reply longer than ~2.4s.
  */
 import { Logger } from '@nestjs/common';
 import { WebSocket } from 'ws';
@@ -38,6 +42,28 @@ import {
 const VAD_RMS_THRESHOLD = Number(process.env.VAD_RMS_THRESHOLD ?? 600);
 const VAD_HANGOVER_MS = Number(process.env.VAD_HANGOVER_MS ?? 800);
 const MAX_UTTERANCE_MS = Number(process.env.MAX_UTTERANCE_MS ?? 15000);
+
+/**
+ * How far ahead of real-time playback we let downstream audio run. The
+ * firmware's decode queue holds only ~2.4s of opus (40 x 60ms packets,
+ * audio_service.h MAX_DECODE_PACKETS_IN_QUEUE) and SILENTLY DROPS packets
+ * pushed while it is full (application.cc OnIncomingAudio pushes with
+ * wait=false). TTS + opus encode outrun playback by an order of magnitude,
+ * so unpaced sending loses most frames of any reply longer than the queue —
+ * heard as the reply repeatedly cutting out mid-sentence. Must stay well
+ * under 2400; large enough to ride out network jitter and the TTS synthesis
+ * gap between sentences.
+ */
+const TTS_PREBUFFER_MS = Number(process.env.TTS_PREBUFFER_MS ?? 1200);
+
+/**
+ * Pause pacing while more than this many bytes sit unflushed in the socket.
+ * Without this, a multi-second TCP stall (WiFi roaming/congestion) would let
+ * paced frames pile up in the socket buffer and arrive at the device as one
+ * burst on recovery, overflowing its decode queue just like unpaced sending.
+ * ~2 KB is a handful of opus frames.
+ */
+const SOCKET_BACKLOG_LIMIT_BYTES = 2048;
 const VAD_HANGOVER_FRAMES = Math.max(1, Math.round(VAD_HANGOVER_MS / FRAME_DURATION_MS));
 const MAX_UTTERANCE_FRAMES = Math.max(1, Math.round(MAX_UTTERANCE_MS / FRAME_DURATION_MS));
 const VAD_MIN_SPEECH_FRAMES = 5; // ~300ms of speech before silence may end a turn
@@ -66,6 +92,13 @@ export class ConversationSession {
   private turnId = 0;
   private speaking = false;
 
+  /**
+   * Wall-clock ms at which the device will finish playing everything we have
+   * sent this turn. Drives real-time pacing of downstream frames (see
+   * TTS_PREBUFFER_MS) and the end-of-turn drain before tts stop.
+   */
+  private playbackEndsAtMs = 0;
+
   constructor(
     private readonly ws: WebSocket,
     private readonly codec: AudioCodec,
@@ -79,15 +112,20 @@ export class ConversationSession {
   onListenStart(mode?: string): void {
     // A new utterance supersedes anything we might still be saying.
     this.abort();
+    this.listenMode = mode ?? 'auto';
+    this.rearmListening();
+    this.logger.log(`Listening started (mode=${this.listenMode})`);
+  }
+
+  /** Start buffering a fresh utterance with clean voice-activity state. */
+  private rearmListening(): void {
     this.pcmChunks = [];
     this.listening = true;
-    this.listenMode = mode ?? 'auto';
     this.framesReceived = 0;
     this.peakRms = 0;
     this.sawSpeech = false;
     this.speechFrames = 0;
     this.silenceFrames = 0;
-    this.logger.log(`Listening started (mode=${this.listenMode})`);
   }
 
   /** listen state=stop from the device — end of utterance. */
@@ -188,6 +226,7 @@ export class ConversationSession {
     this.speaking = true;
     // Discard any downstream remainder left over from a prior/aborted turn.
     this.codec.resetDownstream();
+    this.playbackEndsAtMs = 0;
 
     try {
       const wav = pcm16ToWav(pcm, SAMPLE_RATE_IN);
@@ -219,7 +258,18 @@ export class ConversationSession {
         if (this.isStale(turn)) return;
       }
       if (!spokeAnything) this.logger.log('LLM produced no reply text');
-      else this.logger.log('Turn complete');
+      else {
+        // Hold the tts stop until the buffered tail (~TTS_PREBUFFER_MS) has
+        // actually played, so the bracket tracks real speech: the device may
+        // treat stop as end-of-audio, and `speaking` should stay true while
+        // sound is still coming out. (An abort during this sleep has already
+        // sent its own tts stop; the staleness checks make the rest a no-op.)
+        if (this.isStale(turn)) return;
+        const tailMs = this.playbackEndsAtMs - monotonicMs();
+        if (tailMs > 0) await sleep(tailMs);
+        if (this.isStale(turn)) return;
+        this.logger.log('Turn complete');
+      }
     } catch (err) {
       this.logger.error(`Turn failed: ${asMessage(err)}`);
     } finally {
@@ -228,6 +278,12 @@ export class ConversationSession {
       if (!this.isStale(turn)) {
         this.speaking = false;
         this.sendTtsStop();
+        // Realtime-mode firmware sends `listen start` exactly once and then
+        // streams the mic forever — entering Speaking never stops its audio
+        // processor, so returning to Listening skips SendStartListening
+        // (application.cc). Re-arm ourselves or the session goes deaf after
+        // the first turn.
+        if (this.listenMode === 'realtime') this.rearmListening();
       }
     }
   }
@@ -238,13 +294,43 @@ export class ConversationSession {
       if (this.isStale(turn)) return;
       for (const packet of this.codec.encodeDownstreamPcm(pcmChunk)) {
         if (this.isStale(turn)) return;
-        this.sendBinary(packet);
+        await this.sendAudioFramePaced(packet, turn);
       }
     }
     // Emit this sentence's trailing partial frame so nothing is dropped and the
     // next sentence starts on a clean frame boundary.
     if (this.isStale(turn)) return;
-    for (const packet of this.codec.flushDownstream()) this.sendBinary(packet);
+    for (const packet of this.codec.flushDownstream()) {
+      await this.sendAudioFramePaced(packet, turn);
+    }
+  }
+
+  /**
+   * Send one 60ms downstream opus frame, paced to real time so the device's
+   * small decode queue never overflows (see TTS_PREBUFFER_MS). The first
+   * TTS_PREBUFFER_MS of a turn bursts out to build a cushion against network
+   * jitter and inter-sentence TTS latency; after that frames flow at the
+   * real-time cadence. The clock resets to "now" whenever we fall behind
+   * (start of turn, or a pipeline stall drained the device), so a stall never
+   * causes a catch-up burst bigger than the prebuffer.
+   */
+  private async sendAudioFramePaced(packet: Buffer, turn: number): Promise<void> {
+    // Backpressure: if the device's TCP connection stalls, ws.send() only
+    // buffers — hold pacing so recovery delivers at most a prebuffer's worth
+    // plus this backlog, instead of the whole stall's frames at once.
+    while (this.ws.bufferedAmount > SOCKET_BACKLOG_LIMIT_BYTES) {
+      await sleep(FRAME_DURATION_MS);
+      if (this.isStale(turn)) return;
+    }
+    const now = monotonicMs();
+    if (this.playbackEndsAtMs < now) this.playbackEndsAtMs = now;
+    const aheadMs = this.playbackEndsAtMs - now;
+    if (aheadMs > TTS_PREBUFFER_MS) {
+      await sleep(aheadMs - TTS_PREBUFFER_MS);
+      if (this.isStale(turn)) return;
+    }
+    this.playbackEndsAtMs += FRAME_DURATION_MS;
+    this.sendBinary(packet);
   }
 
   /* ------------------------------ Helpers ------------------------------- */
@@ -293,6 +379,18 @@ export class ConversationSession {
 
 function asMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Monotonic milliseconds for the pacing clock — immune to wall-clock steps
+ * (NTP corrections) that would stall or burst mid-reply audio with Date.now().
+ */
+function monotonicMs(): number {
+  return performance.now();
 }
 
 /** RMS amplitude of a PCM16LE mono buffer (0..32767), for voice-activity detection. */
