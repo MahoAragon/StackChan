@@ -106,19 +106,30 @@ export class XiaozhiWsService implements OnModuleDestroy {
 
         case 'listen':
           if (msg.state === 'start' || msg.state === 'detect') {
-            session.onListenStart();
+            this.logger.log(
+              `listen ${msg.state}${msg.mode ? ` mode=${msg.mode}` : ''} (session=${sessionId})`,
+            );
+            session.onListenStart(msg.mode);
           } else if (msg.state === 'stop') {
+            this.logger.log(`listen stop (session=${sessionId})`);
             session.onListenStop();
           }
           break;
 
         case 'abort':
+          this.logger.log(`abort (session=${sessionId})`);
           session.abort();
           break;
 
         case 'mcp':
           // MCP passthrough is not implemented yet; ignore rather than error.
-          this.logger.debug(`Ignoring MCP frame (session=${sessionId})`);
+          this.logger.log(`mcp frame ignored (session=${sessionId})`);
+          break;
+
+        default:
+          this.logger.warn(
+            `Unhandled frame type "${(msg as { type: string }).type}" (session=${sessionId})`,
+          );
           break;
       }
     });

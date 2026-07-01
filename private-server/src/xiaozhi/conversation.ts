@@ -3,9 +3,14 @@
  *
  * Lifecycle of a turn:
  *   listen state=start  -> begin buffering upstream opus (decoded to PCM16 16k)
- *   listen state=stop   -> wrap PCM as WAV -> STT -> stream LLM (split into
+ *   end of utterance    -> wrap PCM as WAV -> STT -> stream LLM (split into
  *                          sentences) -> TTS each sentence -> opus-encode 24k ->
  *                          send as BINARY frames, bracketed by tts start/stop.
+ *
+ * End of utterance is whichever happens first: the device's `listen stop`
+ * (auto/manual mode), server-side VAD silence, or a hard length cap. The VAD /
+ * cap matter because some firmware configs (realtime mode) stream continuously
+ * and never send stop, and even in auto mode a stop can be lost.
  *
  * Downstream audio is ALWAYS bracketed by {"type":"tts","state":"start"} and
  * {"type":"tts","state":"stop"} because the firmware only decodes opus while it
@@ -18,6 +23,7 @@ import { AudioCodec } from './audio/opus-codec';
 import { pcm16ToWav } from './audio/wav';
 import type { Providers } from './ai/provider.interface';
 import {
+  FRAME_DURATION_MS,
   SAMPLE_RATE_IN,
   buildLlm,
   buildStt,
@@ -28,12 +34,29 @@ import {
   type ServerMessage,
 } from './protocol/messages';
 
+// End-of-utterance detection tuning (env-overridable for real-mic tuning).
+const VAD_RMS_THRESHOLD = Number(process.env.VAD_RMS_THRESHOLD ?? 600);
+const VAD_HANGOVER_MS = Number(process.env.VAD_HANGOVER_MS ?? 800);
+const MAX_UTTERANCE_MS = Number(process.env.MAX_UTTERANCE_MS ?? 15000);
+const VAD_HANGOVER_FRAMES = Math.max(1, Math.round(VAD_HANGOVER_MS / FRAME_DURATION_MS));
+const MAX_UTTERANCE_FRAMES = Math.max(1, Math.round(MAX_UTTERANCE_MS / FRAME_DURATION_MS));
+const VAD_MIN_SPEECH_FRAMES = 5; // ~300ms of speech before silence may end a turn
+const LOG_EVERY_FRAMES = 50; // ~3s heartbeat while listening
+
 export class ConversationSession {
   private readonly logger = new Logger('XiaozhiConv');
 
   /** Decoded upstream PCM16 16k accumulated for the in-flight utterance. */
   private pcmChunks: Buffer[] = [];
   private listening = false;
+  private listenMode = 'auto';
+
+  // Voice-activity state for the current utterance.
+  private framesReceived = 0;
+  private peakRms = 0;
+  private sawSpeech = false;
+  private speechFrames = 0;
+  private silenceFrames = 0;
 
   /**
    * Monotonic id of the current response turn. Bumping it (via abort, a new
@@ -53,24 +76,23 @@ export class ConversationSession {
   /* ------------------------------ Control ------------------------------- */
 
   /** listen state=start | detect — begin a fresh utterance. */
-  onListenStart(): void {
+  onListenStart(mode?: string): void {
     // A new utterance supersedes anything we might still be saying.
     this.abort();
     this.pcmChunks = [];
     this.listening = true;
+    this.listenMode = mode ?? 'auto';
+    this.framesReceived = 0;
+    this.peakRms = 0;
+    this.sawSpeech = false;
+    this.speechFrames = 0;
+    this.silenceFrames = 0;
+    this.logger.log(`Listening started (mode=${this.listenMode})`);
   }
 
-  /** listen state=stop — end of utterance, run the STT->LLM->TTS turn. */
+  /** listen state=stop from the device — end of utterance. */
   onListenStop(): void {
-    if (!this.listening) return;
-    this.listening = false;
-    const pcm = Buffer.concat(this.pcmChunks);
-    this.pcmChunks = [];
-    if (pcm.length === 0) {
-      this.logger.warn('Utterance ended with no audio; ignoring');
-      return;
-    }
-    void this.runTurn(pcm);
+    this.endUtterance('device-stop');
   }
 
   /** abort — stop buffering and cut off any response in progress. */
@@ -99,15 +121,67 @@ export class ConversationSession {
   /** A BINARY frame: one raw opus packet from the device microphone. */
   onOpusPacket(opus: Buffer): void {
     if (!this.listening) return;
+
+    let pcm: Buffer;
     try {
-      const pcm = this.codec.decodeUpstreamPacket(opus);
-      if (pcm.length) this.pcmChunks.push(pcm);
+      pcm = this.codec.decodeUpstreamPacket(opus);
     } catch (err) {
       this.logger.warn(`Failed to decode upstream opus: ${asMessage(err)}`);
+      return;
+    }
+    if (!pcm.length) return;
+
+    this.pcmChunks.push(pcm);
+    this.framesReceived++;
+    if (this.framesReceived === 1) this.logger.log('Receiving audio from device...');
+
+    // Track voice activity to detect end-of-utterance server-side.
+    const rms = frameRms(pcm);
+    if (rms > this.peakRms) this.peakRms = rms;
+    if (rms >= VAD_RMS_THRESHOLD) {
+      this.sawSpeech = true;
+      this.speechFrames++;
+      this.silenceFrames = 0;
+    } else if (this.sawSpeech) {
+      this.silenceFrames++;
+    }
+
+    if (this.framesReceived % LOG_EVERY_FRAMES === 0) {
+      this.logger.log(
+        `...listening ${((this.framesReceived * FRAME_DURATION_MS) / 1000).toFixed(1)}s ` +
+          `(peakRms=${Math.round(this.peakRms)}, speech=${this.sawSpeech}, silence=${this.silenceFrames}f)`,
+      );
+    }
+
+    if (
+      this.sawSpeech &&
+      this.speechFrames >= VAD_MIN_SPEECH_FRAMES &&
+      this.silenceFrames >= VAD_HANGOVER_FRAMES
+    ) {
+      this.endUtterance('vad-silence');
+    } else if (this.framesReceived >= MAX_UTTERANCE_FRAMES) {
+      this.endUtterance('max-length');
     }
   }
 
   /* ------------------------------ The turn ------------------------------ */
+
+  /** End the utterance (device stop, VAD silence, or length cap) and run a turn. */
+  private endUtterance(trigger: string): void {
+    if (!this.listening) return;
+    this.listening = false;
+    const pcm = Buffer.concat(this.pcmChunks);
+    this.pcmChunks = [];
+    if (pcm.length === 0) {
+      this.logger.warn(`Utterance ended (${trigger}) with no audio; ignoring`);
+      return;
+    }
+    const secs = (pcm.length / 2 / SAMPLE_RATE_IN).toFixed(1);
+    this.logger.log(
+      `Utterance ended (${trigger}, ${secs}s, ${this.framesReceived} frames, peakRms=${Math.round(this.peakRms)}) -> running turn`,
+    );
+    void this.runTurn(pcm);
+  }
 
   private async runTurn(pcm: Buffer): Promise<void> {
     const turn = ++this.turnId;
@@ -115,6 +189,7 @@ export class ConversationSession {
 
     try {
       const wav = pcm16ToWav(pcm, SAMPLE_RATE_IN);
+      this.logger.log('Transcribing (STT)...');
       const userText = (await this.providers.stt.transcribe(wav)).trim();
       if (this.isStale(turn)) return;
 
@@ -129,6 +204,7 @@ export class ConversationSession {
       // Open the speaking bracket before any audio.
       this.send(buildTtsStart(this.sessionId));
       this.send(buildLlm('neutral', this.sessionId));
+      this.logger.log('Generating reply (LLM -> TTS)...');
 
       let spokeAnything = false;
       for await (const sentence of this.sentences(
@@ -141,6 +217,7 @@ export class ConversationSession {
         if (this.isStale(turn)) return;
       }
       if (!spokeAnything) this.logger.log('LLM produced no reply text');
+      else this.logger.log('Turn complete');
     } catch (err) {
       this.logger.error(`Turn failed: ${asMessage(err)}`);
     } finally {
@@ -210,4 +287,16 @@ export class ConversationSession {
 
 function asMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** RMS amplitude of a PCM16LE mono buffer (0..32767), for voice-activity detection. */
+function frameRms(pcm: Buffer): number {
+  const n = pcm.length >> 1;
+  if (n === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i + 1 < pcm.length; i += 2) {
+    const s = pcm.readInt16LE(i);
+    sum += s * s;
+  }
+  return Math.sqrt(sum / n);
 }
