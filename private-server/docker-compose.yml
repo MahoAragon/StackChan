@@ -1,0 +1,104 @@
+# StackChan private-server — local voice-AI dependencies (Apple Silicon).
+#
+# Brings up the OpenAI-compatible servers the private-server needs:
+#   tts : Kokoro-FastAPI             ->  http://localhost:50060/v1/audio/speech  (always)
+#   stt : faster-whisper (Speaches)  ->  http://localhost:8000/v1/audio/transcriptions
+#         OPTIONAL — behind the "docker-stt" profile, OFF by default. On Apple
+#         Silicon prefer native whisper.cpp (Metal) with STT_BACKEND=whispercpp.
+#
+# NOT included — run these yourself:
+#   * llama.cpp (LLM) — you already host it, e.g. http://localhost:10000/v1
+#   * private-server itself — `npm run start:prod` on the HOST (port 12800)
+#
+# Topology: private-server runs on the host and reaches these two containers via
+# the published ports 127.0.0.1:8000 / 127.0.0.1:50060 — which are exactly the
+# defaults in src/xiaozhi/config.ts. The ONLY env you must change from the
+# defaults is the model names (the OpenAI aliases whisper-1 / tts-1 aren't
+# recognized by these servers):
+#   STT_MODEL=deepdml/faster-whisper-large-v3-turbo-ct2   # keep in sync with WHISPER__MODEL below
+#   TTS_MODEL=kokoro
+#   TTS_VOICE=af_sky
+#
+# ── Apple Silicon notes ──────────────────────────────────────────────────────
+# These images are published for linux/amd64, so Docker Desktop runs them under
+# Rosetta emulation (Settings → General → "Use Rosetta for x86/amd64 emulation",
+# on by default). IMPORTANT: Docker on macOS cannot reach the Apple GPU (Metal),
+# so whisper runs on the EMULATED CPU no matter how beefy the machine — expect
+# large-v3-turbo to take a couple of seconds per utterance. If that latency
+# bothers you, the real fix is to run whisper natively with Metal (whisper.cpp /
+# mlx-whisper) instead of in Docker — ask and I'll wire that up. Give Docker
+# Desktop ~10–12 GB RAM and plenty of CPUs (Settings → Resources) so the turbo
+# model fits and uses the cores. If an arm64 image appears and you want native
+# speed, delete the `platform:` line on that service.
+#
+# Usage:
+#   docker compose up -d                        # TTS only (use native whisper.cpp for STT)
+#   docker compose --profile docker-stt up -d   # also start the Docker STT fallback
+#   docker compose ps                           # watch health become "healthy"
+#   docker compose down                         # stop (named volumes keep model caches)
+
+name: stackchan-voice
+
+services:
+  stt:
+    # Dockerized faster-whisper (Speaches). OPTIONAL / off by default: it runs on
+    # the emulated CPU. On Apple Silicon prefer native whisper.cpp (Metal) — see
+    # the whisper.cpp setup and set STT_BACKEND=whispercpp. This service only
+    # starts when you ask for it:  docker compose --profile docker-stt up -d
+    # (formerly fedirz/faster-whisper-server; that image is the same project).
+    profiles: ["docker-stt"]
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    platform: linux/amd64
+    container_name: stackchan-stt
+    ports:
+      - "8000:8000"
+    environment:
+      # faster-whisper config (WHISPER__* nested settings). large-v3-turbo is the
+      # best accuracy/latency tradeoff; int8 is the fastest CPU compute type — on
+      # this beefy box you can try int8_float32 or float32 for a touch more
+      # accuracy at some speed cost. Keep WHISPER__MODEL == private-server's
+      # STT_MODEL so only one copy of the model is loaded.
+      WHISPER__MODEL: deepdml/faster-whisper-large-v3-turbo-ct2
+      WHISPER__COMPUTE_TYPE: int8
+      WHISPER__INFERENCE_DEVICE: cpu
+      # Optional: pin CPU threads (0 = use all cores). Env name can vary by image
+      # version; leave commented unless you want to cap it. If the container ever
+      # rejects an unknown WHISPER__* var on boot, drop the offending line.
+      # WHISPER__CPU_THREADS: "0"
+    volumes:
+      # Cache downloaded models so restarts don't re-fetch from HuggingFace.
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      # Port-open check (both images are Python-based; use python3 if `python`
+      # isn't on PATH). Avoids assuming a specific /health route.
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 300s   # first boot downloads the ~1.6 GB turbo model
+    restart: unless-stopped
+
+  tts:
+    # Kokoro-FastAPI (CPU). Kokoro is natively 24 kHz and supports
+    # response_format:"pcm" — exactly what opus-codec.ts expects downstream.
+    # Pin a version (e.g. :v0.2.4) instead of :latest for reproducible runs.
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    platform: linux/amd64
+    container_name: stackchan-tts
+    ports:
+      # host 50060 -> Kokoro's internal 8880 (matches TTS_BASE_URL).
+      - "50060:8880"
+    volumes:
+      # Persist Kokoro model/voice weights if the image downloads them at runtime.
+      - kokoro-cache:/app/api/src/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8880), 2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  kokoro-cache:

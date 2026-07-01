@@ -7,10 +7,12 @@ endpoint and WebSocket message the StackChan firmware needs to function**, so
 you can build and flash the firmware and have it talk to an instance running on
 your own machine.
 
-> Scope: this replaces **only** the StackChan avatar/app backend (backend #2 in
-> [`firmware/docs/server-api-architecture.md`](../firmware/docs/server-api-architecture.md)).
-> It does **not** replace the xiaozhi AI server (`api.tenclass.net`), the M5Stack
-> EzData/UIFlow2 cloud, or the OTA cloud — those remain pointed at their defaults.
+> Scope: this replaces the StackChan avatar/app backend (backend #2 in
+> [`firmware/docs/server-api-architecture.md`](../firmware/docs/server-api-architecture.md))
+> **and** provides a self-hosted, cloud-free drop-in for the xiaozhi AI
+> conversation server (`api.tenclass.net`) — see [Xiaozhi AI backend](#xiaozhi-ai-backend)
+> below. The M5Stack EzData/UIFlow2 cloud and the OTA cloud remain pointed at
+> their defaults.
 
 ## What it implements
 
@@ -82,6 +84,77 @@ Once a device is connected, try:
 curl -X POST http://localhost:12800/control/dance      # make it dance
 curl -X POST http://localhost:12800/control/call/request -d '{"caller":"Maho"}'  # ring it
 ```
+
+## Xiaozhi AI backend
+
+This server also hosts a **self-hosted, cloud-free replacement for the xiaozhi
+AI conversation backend** (normally `api.tenclass.net`), so the device's voice
+assistant runs entirely on your LAN and never contacts tenclass or the M5Stack
+cloud. It speaks the exact WebSocket protocol the firmware enforces
+(`firmware/xiaozhi-esp32/main/protocols/websocket_protocol.cc`).
+
+### Endpoints (same host/port, `12800`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/xiaozhi/ota` | Bootstrap. Returns **only** a `websocket` block (URL + token) and no `mqtt`/`firmware`/`activation`, so the device selects WebSocket and skips cloud activation/upgrade. |
+| `WS`   | `/xiaozhi/v1/` | Realtime conversation: Opus in (16 kHz) → STT → LLM → TTS → Opus out (24 kHz). |
+
+Per-utterance flow: the device brackets speech with `listen start` / `listen
+stop`; on stop we decode the upstream Opus to PCM, transcribe it (STT), stream
+the LLM reply sentence-by-sentence, synthesize each sentence to 24 kHz PCM,
+Opus-encode it, and stream it back bracketed by `tts start` / `tts stop`.
+
+### Required local servers (OpenAI-compatible, no cloud keys)
+
+The pipeline is wired to three OpenAI-compatible HTTP servers via LangChain and
+the `openai` SDK. Any server implementing these APIs works; the defaults target
+localhost. API keys default to a dummy value.
+
+| Role | OpenAI API | Default base URL | Example server |
+|---|---|---|---|
+| LLM | `/v1/chat/completions` (streaming) | `http://127.0.0.1:10000/v1` | llama.cpp server |
+| STT | `/inference` (whisper.cpp) or `/v1/audio/transcriptions` | `http://127.0.0.1:10010/inference` | whisper.cpp `whisper-server` (default, Metal); or speaches via `STT_BACKEND=openai` |
+| TTS | `/v1/audio/speech` (`response_format: pcm`) | `http://127.0.0.1:50060/v1` | Kokoro-FastAPI / openedai-speech / Piper |
+
+Audio rates line up with **no resampling**: upstream 16 kHz == whisper input;
+TTS PCM 24 kHz == device downstream rate. Opus decode/encode uses `opusscript`
+(pure WASM — no native addon to compile). Providers are pluggable behind the interfaces in
+[`src/xiaozhi/ai/provider.interface.ts`](./src/xiaozhi/ai/provider.interface.ts).
+
+### Configure & run
+
+All settings are environment variables with localhost defaults — see
+[`.env.example`](./.env.example) for the full list (`LLM_*`, `STT_*`, `TTS_*`,
+`XIAOZHI_TOKEN`, `PUBLIC_WS_HOST`).
+
+```bash
+# 1. start your local llama.cpp / whisper / TTS servers (see table above)
+# 2. run private-server (env vars optional; defaults point at localhost)
+npm install
+npm run start
+```
+
+Point the firmware's xiaozhi OTA URL at `http://<your-lan-ip>:12800/xiaozhi/ota`
+so the device bootstraps onto this backend instead of the cloud. Quick check:
+
+```bash
+curl -X POST http://localhost:12800/xiaozhi/ota
+# {"websocket":{"url":"ws://localhost:12800/xiaozhi/v1/","token":"stackchan","version":1}}
+```
+
+### Tests (no hardware required)
+
+```bash
+npm run sim   # handshake only: connects to /xiaozhi/v1/ and checks the server hello
+npm run e2e   # full turn through all 3 services: mic Opus -> STT -> LLM -> TTS -> Opus
+```
+
+`npm run e2e` emulates the device end-to-end: it speaks a prompt (auto-generated
+on macOS via `say`, or pass `WAV_PATH=` a 16 kHz mono WAV), runs one real turn,
+and re-transcribes the reply audio to prove it's intelligible. Requires
+private-server **and** the three AI servers to be running. Override with
+`WS_URL` / `WHISPER_URL` / `E2E_PROMPT`.
 
 ## Point the firmware at this server, build & flash
 
