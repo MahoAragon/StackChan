@@ -1,5 +1,9 @@
 set dotenv-load
 
+# Fetch all git submodules (vendored firmware dependencies)
+setup:
+    git submodule update --init --recursive
+
 # Build firmware
 build: _sdkconfig-local
     (. ~/esp/esp-idf/export.sh && cd ./firmware && idf.py build)

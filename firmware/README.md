@@ -3,8 +3,10 @@
 
 ### Fetch Dependencies
 
+Vendored dependencies (`components/*`, `xiaozhi-esp32`) are git submodules. From the repository root:
+
 ```bash
-python3 ./fetch_repos.py
+just setup
 ```
 
 ### Tool Chains
@@ -13,9 +15,14 @@ python3 ./fetch_repos.py
 
 ### Build
 
+From the repository root:
+
 ```bash
-idf.py build
+just build
 ```
+
+This first generates the git-ignored sdkconfig overlay from the repo-root `.env`
+(copy `.env.example` and set `PRIVATE_SERVER_URL`), then builds the firmware.
 
 ### Host-side tests
 
@@ -29,6 +36,8 @@ ctest --test-dir build-host-tests --output-on-failure
 
 ### Flash
 
+From the repository root:
+
 ```bash
-idf.py flash
+just flash
 ```
