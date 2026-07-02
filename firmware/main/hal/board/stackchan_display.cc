@@ -301,21 +301,11 @@ void StackChanAvatarDisplay::CreateIdleMotionModifier()
 {
     auto& stackchan = GetStackChan();
 
-    switch (idle_motion_level_) {
-        case 0:
-            idle_motion_modifier_id_ = -1;
-            return;
-        case 1:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(8000, 12000));
-            return;
-        case 3:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>(2000, 4000));
-            return;
-        case 2:
-        default:
-            idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>());
-            return;
+    if (idle_motion_level_ == 0) {
+        idle_motion_modifier_id_ = -1;
+        return;
     }
+    idle_motion_modifier_id_ = stackchan.addModifier(std::make_unique<IdleMotionModifier>());
 }
 
 void StackChanAvatarDisplay::SetEmotion(const char* emotion)

@@ -19,10 +19,10 @@ namespace stackchan {
  */
 class IdleMotionModifier : public Modifier {
 public:
-    IdleMotionModifier(uint32_t interval_min = 4000, uint32_t interval_max = 8000)
+    IdleMotionModifier(uint32_t interval_min = 60 * 1000, uint32_t interval_max = 5 * 60 * 1000)
         : _interval_min(interval_min), _interval_max(interval_max)
     {
-        _next_tick = GetHAL().millis() + 1000;  // 启动 1 秒后开始第一次动作
+        _next_tick = GetHAL().millis() + Random::getInstance().getInt(_interval_min, _interval_max);
     }
 
     void pause()
@@ -33,7 +33,7 @@ public:
     {
         if (_paused) {
             _paused    = false;
-            _next_tick = GetHAL().millis() + 500;
+            _next_tick = GetHAL().millis() + Random::getInstance().getInt(_interval_min, _interval_max);
         }
     }
 
