@@ -26,20 +26,33 @@ interface ToolTweak {
 }
 
 /**
- * The head-move speed is owned by the server, not the model: the firmware's
- * default (150, and its description saying "150 is natural") makes large
- * commanded turns crawl — the servo maps speed to spring stiffness, so a 45°
- * turn at 150 drags visibly. The idle-motion routine the head should match
- * (firmware/main/stackchan/modifiers/idle_motion.h:74-112) moves at random
- * speeds 100–400, using 250–400 for its deliberate glances; commanded turns
- * get that deliberate band. `speed` is hidden from the model entirely —
- * otherwise it echoes the "150 is natural" hint from the tool description.
+ * Head movement is tuned server-side; the model only picks the target:
+ *
+ * - `speed` is owned by the server, not the model: the firmware's default
+ *   (150, and its description saying "150 is natural") makes large commanded
+ *   turns crawl — the servo maps speed to spring stiffness, so a 45° turn at
+ *   150 drags visibly. The idle-motion routine the head should match
+ *   (firmware/main/stackchan/modifiers/idle_motion.h:74-112) moves at random
+ *   speeds 100–400, using 250–400 for its deliberate glances; commanded turns
+ *   get that deliberate band. Hidden from the model entirely — otherwise it
+ *   echoes the "150 is natural" hint from the tool description.
+ * - The description is REPLACED, not patched: with the firmware's original
+ *   text the model walks a turn in several small calls (move, see success,
+ *   move again), pausing a full LLM round-trip between steps. The rewrite
+ *   demands the final absolute angles in one call.
  */
 const TOOL_TWEAKS: Record<string, ToolTweak> = {
   'self.robot.set_head_angles': {
     hideParams: ['speed'],
     injectArgs: () => ({ speed: 250 + Math.floor(Math.random() * 151) }),
-    fixDescription: (d) => d.replace(/\s*Speed\(100-1000[^)]*\)\.?/, ''),
+    fixDescription: () =>
+      'Move the head to an absolute position in ONE single motion. Always ' +
+      'send the FINAL target angles in one call; never split a turn into ' +
+      'multiple smaller steps and never move relative to the current ' +
+      'position. Ranges: yaw -128 (your full left) to 128 (your full ' +
+      'right), pitch 0 (level) to 90 (straight up), {yaw:0, pitch:0} is ' +
+      'neutral. A natural glance stays within +/-45 yaw; use larger values ' +
+      'only when asked to turn far or look behind.',
   },
 };
 

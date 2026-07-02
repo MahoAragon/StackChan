@@ -46,9 +46,41 @@ import {
 } from './protocol/messages';
 
 // End-of-utterance detection tuning (env-overridable for real-mic tuning).
-const VAD_RMS_THRESHOLD = Number(process.env.VAD_RMS_THRESHOLD ?? 600);
+//
+// This VAD is not a fallback: with AEC on, the firmware listens in REALTIME
+// mode and never sends `listen stop` (application.cc:952 picks
+// kListeningModeRealtime whenever aec_mode_ != kAecOff), so this is the only
+// thing that ends an utterance on real hardware.
+//
+// Speech is classified against an ADAPTIVE threshold derived from a running
+// ambient-noise estimate, not a fixed RMS: a fixed cutoff tuned for one
+// room/voice silently breaks in another — set too high, normal speech never
+// registers, the session "keeps listening", and only a louder repeat ends the
+// turn with BOTH sentences in the buffer. VAD_RMS_THRESHOLD (legacy) pins a
+// fixed threshold and disables adaptation, as an escape hatch for tuning.
+const VAD_FIXED_RMS = Number(process.env.VAD_RMS_THRESHOLD ?? 0);
+/** Attack threshold never drops below this, however quiet the room gets. */
+const VAD_RMS_FLOOR = Number(process.env.VAD_RMS_FLOOR ?? 250);
+/** Speech starts at noiseFloor * this (attack)... */
+const VAD_SPEECH_FACTOR = Number(process.env.VAD_SPEECH_FACTOR ?? 3.0);
+/** ...and continues down to noiseFloor * this (release) — hysteresis. */
+const VAD_RELEASE_FACTOR = Number(process.env.VAD_RELEASE_FACTOR ?? 2.0);
 const VAD_HANGOVER_MS = Number(process.env.VAD_HANGOVER_MS ?? 800);
 const MAX_UTTERANCE_MS = Number(process.env.MAX_UTTERANCE_MS ?? 15000);
+/** Where the noise estimate starts before any audio has been heard. */
+const VAD_NOISE_FLOOR_INIT = 150;
+/**
+ * Ceiling on the noise estimate. Quiet-but-audible speech misread as noise
+ * would otherwise ratchet the floor (and with it the attack threshold) up
+ * until nothing registers as speech — the exact failure this VAD replaces.
+ */
+const VAD_NOISE_FLOOR_MAX = 350;
+/**
+ * Consecutive above-threshold frames before they count as speech. A single
+ * 60ms spike (servo click, tap) would otherwise reset the accumulated
+ * silence and stretch the turn.
+ */
+const VAD_SPEECH_DEBOUNCE_FRAMES = 2;
 
 /**
  * How far ahead of real-time playback we let downstream audio run. The
@@ -90,6 +122,17 @@ export class ConversationSession {
   private sawSpeech = false;
   private speechFrames = 0;
   private silenceFrames = 0;
+  /** Currently inside a speech run (hysteresis: releases lower than it attacks). */
+  private inSpeech = false;
+  /** Consecutive above-threshold frames (debounce before a run starts). */
+  private speechRun = 0;
+  /**
+   * Ambient-noise RMS estimate. Persists across utterances — it describes the
+   * room, not the turn. Falls quickly, rises slowly (asymmetric EMA), so a
+   * burst of misclassified speech cannot drag it up much before the next
+   * inter-word gap pulls it back down.
+   */
+  private noiseFloor = VAD_NOISE_FLOOR_INIT;
 
   /**
    * Monotonic id of the current response turn. Bumping it (via abort, a new
@@ -144,6 +187,9 @@ export class ConversationSession {
     this.sawSpeech = false;
     this.speechFrames = 0;
     this.silenceFrames = 0;
+    this.inSpeech = false;
+    this.speechRun = 0;
+    // noiseFloor deliberately NOT reset: the room didn't change.
   }
 
   /** listen state=stop from the device — end of utterance. */
@@ -194,18 +240,46 @@ export class ConversationSession {
     // Track voice activity to detect end-of-utterance server-side.
     const rms = frameRms(pcm);
     if (rms > this.peakRms) this.peakRms = rms;
-    if (rms >= VAD_RMS_THRESHOLD) {
-      this.sawSpeech = true;
-      this.speechFrames++;
-      this.silenceFrames = 0;
-    } else if (this.sawSpeech) {
-      this.silenceFrames++;
+
+    const attack =
+      VAD_FIXED_RMS > 0
+        ? VAD_FIXED_RMS
+        : Math.max(VAD_RMS_FLOOR, this.noiseFloor * VAD_SPEECH_FACTOR);
+    const release =
+      VAD_FIXED_RMS > 0
+        ? VAD_FIXED_RMS
+        : Math.max(VAD_RMS_FLOOR * 0.8, this.noiseFloor * VAD_RELEASE_FACTOR);
+
+    if (rms >= (this.inSpeech ? release : attack)) {
+      this.speechRun++;
+      if (this.inSpeech || this.speechRun >= VAD_SPEECH_DEBOUNCE_FRAMES) {
+        if (!this.sawSpeech) {
+          this.logger.log(
+            `Speech detected (rms=${Math.round(rms)}, attack=${Math.round(attack)}, floor=${Math.round(this.noiseFloor)})`,
+          );
+        }
+        this.inSpeech = true;
+        this.sawSpeech = true;
+        this.speechFrames++;
+        this.silenceFrames = 0;
+      }
+      // else: an isolated spike — don't reset the silence run for it.
+    } else {
+      this.speechRun = 0;
+      this.inSpeech = false;
+      if (this.sawSpeech) this.silenceFrames++;
+      // Only non-speech frames teach the noise estimate; fall fast, rise slow.
+      this.noiseFloor =
+        rms < this.noiseFloor
+          ? this.noiseFloor * 0.7 + rms * 0.3
+          : Math.min(VAD_NOISE_FLOOR_MAX, this.noiseFloor * 0.98 + rms * 0.02);
     }
 
     if (this.framesReceived % LOG_EVERY_FRAMES === 0) {
       this.logger.log(
         `...listening ${((this.framesReceived * FRAME_DURATION_MS) / 1000).toFixed(1)}s ` +
-          `(peakRms=${Math.round(this.peakRms)}, speech=${this.sawSpeech}, silence=${this.silenceFrames}f)`,
+          `(peakRms=${Math.round(this.peakRms)}, speech=${this.sawSpeech}, silence=${this.silenceFrames}f, ` +
+          `floor=${Math.round(this.noiseFloor)}, attack=${Math.round(attack)})`,
       );
     }
 
@@ -234,7 +308,8 @@ export class ConversationSession {
     }
     const secs = (pcm.length / 2 / SAMPLE_RATE_IN).toFixed(1);
     this.logger.log(
-      `Utterance ended (${trigger}, ${secs}s, ${this.framesReceived} frames, peakRms=${Math.round(this.peakRms)}) -> running turn`,
+      `Utterance ended (${trigger}, ${secs}s, ${this.framesReceived} frames, ` +
+        `peakRms=${Math.round(this.peakRms)}, floor=${Math.round(this.noiseFloor)}) -> running turn`,
     );
     void this.runTurn(pcm);
   }
