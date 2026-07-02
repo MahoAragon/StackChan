@@ -23,9 +23,9 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { WebSocket } = require('ws');
 const OpusScript = require('opusscript'); // pure-WASM opus (matches server codec)
+const { ensureInputWav, parseWav, pcm16ToWav } = require('./lib/wav.cjs');
 
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:12800/xiaozhi/v1/';
 const WHISPER_URL = process.env.WHISPER_URL || 'http://127.0.0.1:10010/inference';
@@ -38,50 +38,8 @@ const SR_IN = 16000, SR_OUT = 24000, FRAME_MS = 60;
 const FRAME_SAMPLES_IN = (SR_IN * FRAME_MS) / 1000; // 960
 const FRAME_BYTES_IN = FRAME_SAMPLES_IN * 2; // 1920
 
-/** Make a 16k mono WAV of PROMPT via macOS say+afconvert if one isn't supplied. */
-function ensureInputWav() {
-  if (fs.existsSync(WAV_PATH)) return;
-  const aiff = WAV_PATH.replace(/\.wav$/, '') + '.aiff';
-  try {
-    execFileSync('say', ['-o', aiff, PROMPT]);
-    execFileSync('afconvert', ['-f', 'WAVE', '-d', 'LEI16@16000', '-c', '1', aiff, WAV_PATH]);
-  } catch (e) {
-    throw new Error(
-      `No test audio and could not generate one via macOS say/afconvert (${e.message}). ` +
-        `Provide a 16 kHz mono WAV via WAV_PATH=/path/to/file.wav`,
-    );
-  }
-}
-
-function parseWav(buf) {
-  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE')
-    throw new Error('not a WAV file');
-  let off = 12, fmt = null, data = null;
-  while (off + 8 <= buf.length) {
-    const id = buf.toString('ascii', off, off + 4);
-    const sz = buf.readUInt32LE(off + 4);
-    const body = off + 8;
-    if (id === 'fmt ') fmt = { channels: buf.readUInt16LE(body + 2), sampleRate: buf.readUInt32LE(body + 4) };
-    else if (id === 'data') data = { offset: body, length: Math.min(sz, buf.length - body) };
-    off = body + sz + (sz & 1);
-    if (fmt && data) break;
-  }
-  if (!fmt || !data) throw new Error('missing fmt/data chunk');
-  return { ...fmt, ...data };
-}
-
-function pcm16ToWav(pcm, sampleRate, channels = 1) {
-  const h = Buffer.alloc(44);
-  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8);
-  h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20);
-  h.writeUInt16LE(channels, 22); h.writeUInt32LE(sampleRate, 24);
-  h.writeUInt32LE(sampleRate * channels * 2, 28); h.writeUInt16LE(channels * 2, 32); h.writeUInt16LE(16, 34);
-  h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([h, pcm]);
-}
-
 async function main() {
-  ensureInputWav();
+  ensureInputWav(WAV_PATH, PROMPT);
 
   // Encode the 16k WAV into upstream Opus frames.
   const wav = fs.readFileSync(WAV_PATH);

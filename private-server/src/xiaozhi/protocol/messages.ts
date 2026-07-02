@@ -159,6 +159,15 @@ export function buildLlm(emotion: string, sessionId?: string): LlmMessage {
   return { type: 'llm', emotion, session_id: sessionId };
 }
 
+/**
+ * Tunnel one MCP JSON-RPC object to the device. The firmware unwraps
+ * `payload` and hands it to its McpServer (application.cc OnIncomingJson
+ * "mcp" branch).
+ */
+export function buildMcp(payload: unknown, sessionId?: string): McpMessage {
+  return { type: 'mcp', payload, session_id: sessionId };
+}
+
 /** Serialize any server message to the JSON TEXT payload sent over the socket. */
 export function encodeServerMessage(msg: ServerMessage): string {
   return JSON.stringify(msg);

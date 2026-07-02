@@ -98,12 +98,38 @@ cloud. It speaks the exact WebSocket protocol the firmware enforces
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/xiaozhi/ota` | Bootstrap. Returns **only** a `websocket` block (URL + token) and no `mqtt`/`firmware`/`activation`, so the device selects WebSocket and skips cloud activation/upgrade. |
-| `WS`   | `/xiaozhi/v1/` | Realtime conversation: Opus in (16 kHz) → STT → LLM → TTS → Opus out (24 kHz). |
+| `WS`   | `/xiaozhi/v1/` | Realtime conversation: Opus in (16 kHz) → STT → LLM → TTS → Opus out (24 kHz), plus the tunneled MCP control layer (tool discovery + calls). |
+| `POST` | `/xiaozhi/vision/explain` | Camera photo upload (multipart `question` + `file`). The device gets this URL via MCP `initialize`; the response body is returned verbatim to the LLM as the take_photo tool result. |
 
 Per-utterance flow: the device brackets speech with `listen start` / `listen
 stop`; on stop we decode the upstream Opus to PCM, transcribe it (STT), stream
 the LLM reply sentence-by-sentence, synthesize each sentence to 24 kHz PCM,
 Opus-encode it, and stream it back bracketed by `tts start` / `tts stop`.
+
+### Tools (function calling)
+
+The LLM can call tools during a turn ([`src/xiaozhi/tools/`](./src/xiaozhi/tools/)).
+Two kinds share one registry, so the model sees a single flat function list:
+
+- **Server tools** — run in this process. Defined in
+  [`server-tools.ts`](./src/xiaozhi/tools/server-tools.ts); to add one, append
+  an object with `name`/`description`/`parameters` (JSON Schema) and an
+  `execute()` — it is auto-exposed to the model on the next turn.
+- **Device tools** — run on the robot. Right after the websocket `hello`, the
+  server speaks MCP (JSON-RPC tunneled in `{"type":"mcp"}` frames,
+  [`src/xiaozhi/mcp/mcp-session.ts`](./src/xiaozhi/mcp/mcp-session.ts)):
+  `initialize` hands the device the vision-upload URL + token, `tools/list`
+  discovers what the firmware exposes (`self.camera.take_photo`,
+  `self.robot.set_head_angles`, `self.robot.set_led_color`, reminders, volume,
+  …), and each LLM call becomes a `tools/call` round-trip. MCP names are
+  dotted; they are exposed to the model with underscores
+  (`self_camera_take_photo`) and mapped back on execution.
+
+**"What can you see?"** end-to-end: STT → the LLM calls
+`self.camera.take_photo` → server sends MCP `tools/call` → firmware captures a
+photo (showing it on the LCD) and POSTs it to `/xiaozhi/vision/explain` → the
+vision model answers the LLM's question about it → the reply is spoken. The
+photo never leaves your LAN.
 
 ### Required local servers (OpenAI-compatible, no cloud keys)
 
@@ -113,9 +139,10 @@ localhost. API keys default to a dummy value.
 
 | Role | OpenAI API | Default base URL | Example server |
 |---|---|---|---|
-| LLM | `/v1/chat/completions` (streaming) | `http://127.0.0.1:10000/v1` | llama.cpp server |
+| LLM | `/v1/chat/completions` (streaming, **tools** for function calling) | `http://127.0.0.1:10000/v1` | llama.cpp server |
 | STT | `/inference` (whisper.cpp) or `/v1/audio/transcriptions` | `http://127.0.0.1:10010/inference` | whisper.cpp `whisper-server` (default, Metal); or speaches via `STT_BACKEND=openai` |
 | TTS | `/v1/audio/speech` (`response_format: pcm`) | `http://127.0.0.1:50060/v1` | Kokoro-FastAPI / openedai-speech / Piper |
+| Vision | `/v1/chat/completions` (image_url content) | `VISION_*`, defaults to `LLM_*` | multimodal llama.cpp (`--mmproj`) |
 
 Audio rates line up with **no resampling**: upstream 16 kHz == whisper input;
 TTS PCM 24 kHz == device downstream rate. Opus decode/encode uses `opusscript`
@@ -146,8 +173,9 @@ curl -X POST http://localhost:12800/xiaozhi/ota
 ### Tests (no hardware required)
 
 ```bash
-npm run sim   # handshake only: connects to /xiaozhi/v1/ and checks the server hello
-npm run e2e   # full turn through all 3 services: mic Opus -> STT -> LLM -> TTS -> Opus
+npm run sim          # no AI servers needed: hello handshake + MCP initialize/tools/list
+npm run e2e          # full turn through all 3 services: mic Opus -> STT -> LLM -> TTS -> Opus
+npm run e2e:vision   # "what can you see": full turn + MCP camera emulation + photo upload
 ```
 
 `npm run e2e` emulates the device end-to-end: it speaks a prompt (auto-generated
@@ -155,6 +183,13 @@ on macOS via `say`, or pass `WAV_PATH=` a 16 kHz mono WAV), runs one real turn,
 and re-transcribes the reply audio to prove it's intelligible. Requires
 private-server **and** the three AI servers to be running. Override with
 `WS_URL` / `WHISPER_URL` / `E2E_PROMPT`.
+
+`npm run e2e:vision` additionally emulates the firmware's MCP server and
+camera: it answers `initialize`/`tools/list`, and when the LLM calls
+`self.camera.take_photo` it uploads a test image (white circle on red) to the
+vision endpoint exactly the way `StackChanCamera::Explain` does (chunked
+multipart + bearer token), then asserts the reply audio describes it. Needs a
+tool-capable, multimodal model behind the LLM/vision endpoints.
 
 ## Point the firmware at this server, build & flash
 

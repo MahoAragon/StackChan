@@ -10,7 +10,8 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main.js",
     "sim": "node scripts/sim-device.mjs",
-    "e2e": "node scripts/e2e-turn.cjs"
+    "e2e": "node scripts/e2e-turn.cjs",
+    "e2e:vision": "node scripts/e2e-vision.cjs"
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",

@@ -12,7 +12,7 @@
  */
 import { Controller, HttpCode, Logger, Post, Req } from '@nestjs/common';
 import type { Request } from 'express';
-import { loadXiaozhiConfig } from './config';
+import { loadXiaozhiConfig, resolvePublicHost } from './config';
 import { XIAOZHI_WS_PATH } from './xiaozhi-ws.service';
 
 @Controller()
@@ -25,11 +25,7 @@ export class XiaozhiOtaController {
   @Post('xiaozhi/ota')
   @HttpCode(200)
   bootstrap(@Req() req: Request) {
-    // Point the device back at whichever host it reached us on so the same
-    // config works across LAN IPs; PUBLIC_WS_HOST is an explicit override.
-    const host =
-      process.env.PUBLIC_WS_HOST ?? req.headers.host ?? '10.0.0.200:12800';
-    const url = `ws://${host}${XIAOZHI_WS_PATH}`;
+    const url = `ws://${resolvePublicHost(req.headers.host)}${XIAOZHI_WS_PATH}`;
     this.logger.log(`OTA bootstrap -> ${url}`);
     return {
       websocket: {

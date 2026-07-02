@@ -6,10 +6,15 @@
  * does (firmware/xiaozhi-esp32/main/protocols/websocket_protocol.cc):
  *
  *   1. connect (retry-poll for up to ~5s in case the server is still booting)
- *   2. send the client `hello` TEXT frame
+ *   2. send the client `hello` TEXT frame (features.mcp = true, like firmware)
  *   3. assert the server `hello` is valid: type="hello", transport="websocket",
  *      a non-empty session_id, and audio_params.sample_rate == 24000
- *   4. send `listen start` -> a couple of BINARY opus frames -> `listen stop`
+ *   4. answer the server's MCP handshake the way the firmware's McpServer does
+ *      (mcp_server.cc): reply to `initialize` (capturing capabilities.vision)
+ *      and `tools/list` (advertising a fake self.camera.take_photo), and assert
+ *      the server actually drives both — that is what provisions the camera and
+ *      discovers device tools on real hardware.
+ *   5. send `listen start` -> a couple of BINARY opus frames -> `listen stop`
  *      and assert the connection does NOT crash. With llama/whisper/tts down the
  *      server hits a provider error mid-turn; that is fine as long as the socket
  *      stays OPEN (and, best-effort, brackets its reply with tts start/stop).
@@ -45,9 +50,13 @@ async function connectWithRetry() {
   const deadline = Date.now() + CONNECT_DEADLINE_MS;
   let attempt = 0;
   let lastReason = 'unknown';
+  // The firmware's ws client sends the Host header WITHOUT the port
+  // (esp-ml307 web_socket.cc:141-142) — mimic that, or bugs in the server's
+  // host:port reconstruction (vision URL!) stay invisible here.
+  const portlessHost = new globalThis.URL(URL.replace(/^ws/, 'http')).hostname;
   while (true) {
     attempt++;
-    const ws = new WebSocket(URL);
+    const ws = new WebSocket(URL, { headers: { Host: portlessHost } });
     const outcome = await new Promise((resolve) => {
       ws.on('error', () => {}); // guard: never let a raw 'error' throw
       ws.once('open', () => resolve('open'));
@@ -94,10 +103,81 @@ function wireInbox(ws) {
     } catch {}
     const frame = { kind: 'text', text, obj };
     inbox.push(frame);
+    if (obj?.type === 'mcp') {
+      handleMcp(ws, obj.payload);
+      return; // MCP frames are answered here, not queued for the main flow
+    }
     const w = textWaiters.shift();
     if (w) w(frame);
     else pendingText.push(frame);
   });
+}
+
+/* ------------------------- MCP device emulation --------------------------- */
+
+/**
+ * Answer the server's MCP JSON-RPC requests the way the firmware's McpServer
+ * does (firmware/xiaozhi-esp32/main/mcp_server.cc ParseMessage): numeric-id
+ * requests for initialize / tools/list / tools/call, replies wrapped back into
+ * {"type":"mcp","payload":...} frames.
+ */
+const mcpState = { visionUrl: null, visionToken: null, toolsListed: false, calls: [] };
+
+const SIM_DEVICE_TOOLS = [
+  {
+    name: 'self.camera.take_photo',
+    description:
+      'Always remember you have a camera. If the user asks you to see something, ' +
+      'use this tool to take a photo and then explain it.',
+    inputSchema: {
+      type: 'object',
+      properties: { question: { type: 'string' } },
+      required: ['question'],
+    },
+  },
+  {
+    name: 'self.robot.set_head_angles',
+    description: 'Move the robot head to the given yaw/pitch angles.',
+    inputSchema: {
+      type: 'object',
+      properties: { yaw: { type: 'integer' }, pitch: { type: 'integer' } },
+    },
+  },
+];
+
+function handleMcp(ws, payload) {
+  const { id, method, params } = payload ?? {};
+  if (typeof id !== 'number' || typeof method !== 'string') return;
+  const reply = (result) =>
+    ws.send(JSON.stringify({ type: 'mcp', payload: { jsonrpc: '2.0', id, result } }));
+  if (method === 'initialize') {
+    mcpState.visionUrl = params?.capabilities?.vision?.url ?? null;
+    mcpState.visionToken = params?.capabilities?.vision?.token ?? null;
+    log(`mcp initialize (vision.url=${mcpState.visionUrl})`);
+    reply({
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'sim-device', version: '1.0.0' },
+    });
+  } else if (method === 'tools/list') {
+    mcpState.toolsListed = true;
+    log('mcp tools/list');
+    reply({ tools: SIM_DEVICE_TOOLS });
+  } else if (method === 'tools/call') {
+    mcpState.calls.push(params?.name);
+    log(`mcp tools/call ${params?.name}`);
+    reply({
+      content: [{ type: 'text', text: '{"success":true,"result":"(sim) ok"}' }],
+      isError: false,
+    });
+  } else {
+    ws.send(
+      JSON.stringify({
+        type: 'mcp',
+        payload: { jsonrpc: '2.0', id, error: { message: `Method not implemented: ${method}` } },
+      }),
+    );
+  }
 }
 
 /** Resolve with the next server TEXT frame, or reject on timeout. */
@@ -197,7 +277,32 @@ async function main() {
   // Informational (not fatal): downstream frame duration.
   log(`hello.audio_params.frame_duration = ${JSON.stringify(hello?.audio_params?.frame_duration)}`);
 
-  // 4. drive one listen turn and make sure the connection survives it
+  // 4. the server must drive the MCP handshake (vision provisioning + tool
+  // discovery) right after hello; give it a moment to complete.
+  const mcpDeadline = Date.now() + 3_000;
+  while (Date.now() < mcpDeadline && !mcpState.toolsListed) await delay(50);
+  check(
+    'mcp initialize received with capabilities.vision.url',
+    typeof mcpState.visionUrl === 'string' &&
+      mcpState.visionUrl.includes('/xiaozhi/vision/explain'),
+    `url=${JSON.stringify(mcpState.visionUrl)}`,
+  );
+  // The device dials the URL literally: with the port missing it goes to :80
+  // (the firmware ws client's Host header has no port to echo back).
+  const wsPort = new globalThis.URL(URL.replace(/^ws/, 'http')).port || '80';
+  check(
+    `vision url carries the server port :${wsPort}`,
+    typeof mcpState.visionUrl === 'string' &&
+      new globalThis.URL(mcpState.visionUrl).port === wsPort,
+    `url=${JSON.stringify(mcpState.visionUrl)}`,
+  );
+  check(
+    'mcp initialize carries the bearer token',
+    typeof mcpState.visionToken === 'string' && mcpState.visionToken.length > 0,
+  );
+  check('mcp tools/list received', mcpState.toolsListed);
+
+  // 5. drive one listen turn and make sure the connection survives it
   const frames = makeUpstreamFrames();
   log(`using ${frames.length} tiny upstream audio frames`);
 

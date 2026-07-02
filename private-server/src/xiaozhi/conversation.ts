@@ -32,7 +32,7 @@ import { Logger } from '@nestjs/common';
 import { WebSocket } from 'ws';
 import { AudioCodec } from './audio/opus-codec';
 import { pcm16ToWav } from './audio/wav';
-import type { Providers } from './ai/provider.interface';
+import type { Providers, ToolSource } from './ai/provider.interface';
 import {
   FRAME_DURATION_MS,
   SAMPLE_RATE_IN,
@@ -120,6 +120,8 @@ export class ConversationSession {
     private readonly codec: AudioCodec,
     private readonly providers: Providers,
     private readonly sessionId: string,
+    /** Session tool catalog (server + MCP device tools) the LLM may call. */
+    private readonly tools?: ToolSource,
   ) {}
 
   /* ------------------------------ Control ------------------------------- */
@@ -266,7 +268,9 @@ export class ConversationSession {
 
       let spokeAnything = false;
       for await (const sentence of this.sentences(
-        this.providers.llm.reply(this.sessionId, userText),
+        this.providers.llm.reply(this.sessionId, userText, this.tools, () =>
+          this.isStale(turn),
+        ),
       )) {
         if (this.isStale(turn)) return;
         spokeAnything = true;

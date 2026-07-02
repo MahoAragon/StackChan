@@ -33,6 +33,26 @@ export interface XiaozhiConfig {
     model: string;
     voice: string;
   };
+  /**
+   * Vision: OpenAI-compatible /v1/chat/completions server that accepts
+   * image_url content parts (multimodal llama.cpp). Defaults to the LLM server
+   * so a single multimodal model serves both chat and camera-photo questions.
+   */
+  vision: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    systemPrompt: string;
+    /**
+     * Hard bound on one photo inference. The device waits at most 30s for the
+     * response headers after uploading (esp-ml307 HttpClient default
+     * timeout_ms_, http_client.h:101; Explain never raises it), so an answer
+     * that takes longer is undeliverable — and with vision sharing the chat
+     * llama.cpp by default, an orphaned request would also block the follow-up
+     * turn. Must stay under 30s.
+     */
+    timeoutMs: number;
+  };
   /** Shared bootstrap token handed to the device by the OTA endpoint. */
   token: string;
 }
@@ -47,19 +67,20 @@ function env(name: string, fallback: string): string {
 
 /** Build the runtime config from environment variables with localhost defaults. */
 export function loadXiaozhiConfig(): XiaozhiConfig {
+  const llm = {
+    baseUrl: env('LLM_BASE_URL', 'http://127.0.0.1:10000/v1'),
+    apiKey: env('LLM_API_KEY', DUMMY_KEY),
+    model: env('LLM_MODEL', 'default'),
+    systemPrompt: env(
+      'LLM_SYSTEM_PROMPT',
+      'You are StackChan, a friendly desktop robot companion. ' +
+        'Keep replies short, warm, and conversational. ' +
+        'Your replies are read aloud by text-to-speech: never use emojis, ' +
+        'emoticons, or other symbols that do not read well aloud.',
+    ),
+  };
   return {
-    llm: {
-      baseUrl: env('LLM_BASE_URL', 'http://127.0.0.1:10000/v1'),
-      apiKey: env('LLM_API_KEY', DUMMY_KEY),
-      model: env('LLM_MODEL', 'default'),
-      systemPrompt: env(
-        'LLM_SYSTEM_PROMPT',
-        'You are StackChan, a friendly desktop robot companion. ' +
-          'Keep replies short, warm, and conversational. ' +
-          'Your replies are read aloud by text-to-speech: never use emojis, ' +
-          'emoticons, or other symbols that do not read well aloud.',
-      ),
-    },
+    llm,
     stt: {
       backend:
         env('STT_BACKEND', 'whispercpp') === 'openai' ? 'openai' : 'whispercpp',
@@ -75,6 +96,57 @@ export function loadXiaozhiConfig(): XiaozhiConfig {
       model: env('TTS_MODEL', 'kokoro'),
       voice: env('TTS_VOICE', 'af_sky'),
     },
+    vision: {
+      baseUrl: env('VISION_BASE_URL', llm.baseUrl),
+      apiKey: env('VISION_API_KEY', llm.apiKey),
+      model: env('VISION_MODEL', llm.model),
+      systemPrompt: env(
+        'VISION_SYSTEM_PROMPT',
+        'You are the eyes of StackChan, a desktop robot. The attached photo ' +
+          'was just taken by your camera. Answer the question about it ' +
+          'directly and concisely in one or two sentences; your answer is ' +
+          'spoken aloud by the robot.',
+      ),
+      timeoutMs: Number(env('VISION_TIMEOUT_MS', '25000')),
+    },
     token: env('XIAOZHI_TOKEN', 'stackchan'),
   };
+}
+
+/**
+ * The host:port a device should use to reach this server over HTTP/WS —
+ * whichever host it already reached us on (works across LAN IPs), with
+ * PUBLIC_WS_HOST as the explicit override. Shared by the OTA bootstrap
+ * (websocket URL) and the MCP handshake (vision photo-upload URL).
+ *
+ * The port CANNOT be trusted to arrive in the Host header: the firmware's
+ * HTTP client appends non-default ports (esp-ml307 http_client.cc:126-129, so
+ * OTA requests carry "10.0.0.200:12800") but its WEBSOCKET client sends the
+ * bare host (web_socket.cc:141-142). A URL built naively from a ws upgrade's
+ * Host header therefore points at port 80 and the camera's photo upload dies
+ * with "Failed to connect to explain URL". When the header has no port, take
+ * it from the very TCP socket the device is connected on — by definition the
+ * port it can reach us at. The last-resort constant only matters for clients
+ * that omit the Host header entirely.
+ */
+export function resolvePublicHost(
+  requestHost: string | undefined,
+  socket?: { localAddress?: string; localPort?: number },
+): string {
+  const override = process.env.PUBLIC_WS_HOST;
+  if (override) return override;
+  if (requestHost) {
+    // Port present? (colon after the last ']' so bracketed IPv6 works)
+    const afterV6 = requestHost.slice(requestHost.lastIndexOf(']') + 1);
+    if (afterV6.includes(':')) return requestHost;
+    if (socket?.localPort) return `${requestHost}:${socket.localPort}`;
+    return requestHost;
+  }
+  if (socket?.localAddress && socket.localPort) {
+    // Node reports IPv4 on a dual-stack listener as "::ffff:10.0.0.200".
+    const ip = socket.localAddress.replace(/^::ffff:/, '');
+    const host = ip.includes(':') ? `[${ip}]` : ip;
+    return `${host}:${socket.localPort}`;
+  }
+  return '10.0.0.200:12800';
 }
