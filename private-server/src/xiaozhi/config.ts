@@ -55,7 +55,9 @@ export function loadXiaozhiConfig(): XiaozhiConfig {
       systemPrompt: env(
         'LLM_SYSTEM_PROMPT',
         'You are StackChan, a friendly desktop robot companion. ' +
-          'Keep replies short, warm, and conversational.',
+          'Keep replies short, warm, and conversational. ' +
+          'Your replies are read aloud by text-to-speech: never use emojis, ' +
+          'emoticons, or other symbols that do not read well aloud.',
       ),
     },
     stt: {
