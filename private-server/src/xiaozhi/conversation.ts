@@ -14,12 +14,19 @@
  *
  * Downstream audio is ALWAYS bracketed by {"type":"tts","state":"start"} and
  * {"type":"tts","state":"stop"} because the firmware only decodes opus while it
- * is in the Speaking state. Errors are caught so a turn can never leave the
- * device stuck without a tts stop.
+ * is in the Speaking state. The start is sent just-in-time before the first
+ * audio frame (not at STT time): entering Speaking also starts the device's
+ * talking animation, which must not lead the sound. Errors are caught so a
+ * turn can never leave the device stuck without a tts stop.
  *
  * Downstream frames are paced to real time (TTS_PREBUFFER_MS): the device's
  * decode queue is tiny and drops packets when full, so sending as fast as TTS
  * encodes would truncate every reply longer than ~2.4s.
+ *
+ * Sentence text (tts sentence_start) is scheduled onto the same playback
+ * clock: the device renders the text the moment the message arrives, so it is
+ * sent when the sentence is projected to be HEARD, not when its audio bytes
+ * are sent (which run a prebuffer ahead).
  */
 import { Logger } from '@nestjs/common';
 import { WebSocket } from 'ws';
@@ -86,8 +93,9 @@ export class ConversationSession {
 
   /**
    * Monotonic id of the current response turn. Bumping it (via abort, a new
-   * utterance, or socket close) signals any in-flight async loop to bail so we
-   * never talk over ourselves.
+   * utterance, end of turn, or socket close) signals any in-flight async loop
+   * and any scheduled sentence-text timer to bail so we never talk over
+   * ourselves or paint text for a turn that is over.
    */
   private turnId = 0;
   private speaking = false;
@@ -98,6 +106,14 @@ export class ConversationSession {
    * TTS_PREBUFFER_MS) and the end-of-turn drain before tts stop.
    */
   private playbackEndsAtMs = 0;
+
+  /**
+   * Whether this turn's {"type":"tts","state":"start"} has been sent. The
+   * bracket opens just-in-time before the first audio frame — the device
+   * starts its talking animation on entering Speaking, so an eager start
+   * (sent at STT time) animates a silent face for the whole LLM+TTS latency.
+   */
+  private ttsBracketOpen = false;
 
   constructor(
     private readonly ws: WebSocket,
@@ -227,6 +243,7 @@ export class ConversationSession {
     // Discard any downstream remainder left over from a prior/aborted turn.
     this.codec.resetDownstream();
     this.playbackEndsAtMs = 0;
+    this.ttsBracketOpen = false;
 
     try {
       const wav = pcm16ToWav(pcm, SAMPLE_RATE_IN);
@@ -241,10 +258,10 @@ export class ConversationSession {
       }
       this.logger.log(`STT: "${userText}"`);
       this.send(buildStt(userText, this.sessionId));
-
-      // Open the speaking bracket before any audio.
-      this.send(buildTtsStart(this.sessionId));
-      this.send(buildLlm('neutral', this.sessionId));
+      // The tts start bracket is NOT sent here: the device starts its talking
+      // animation the moment it enters Speaking, which would run soundless for
+      // the ~1s of LLM + TTS latency. sendAudioFramePaced opens the bracket
+      // just-in-time before the first audio frame.
       this.logger.log('Generating reply (LLM -> TTS)...');
 
       let spokeAnything = false;
@@ -253,7 +270,6 @@ export class ConversationSession {
       )) {
         if (this.isStale(turn)) return;
         spokeAnything = true;
-        this.send(buildTtsSentenceStart(sentence, this.sessionId));
         await this.speakSentence(sentence, turn);
         if (this.isStale(turn)) return;
       }
@@ -277,6 +293,11 @@ export class ConversationSession {
       // that superseded us already sent its own tts stop.
       if (!this.isStale(turn)) {
         this.speaking = false;
+        // Invalidate scheduled sentence text before closing the bracket: a
+        // turn that ends through the error path skips the tail drain and can
+        // leave a text timer armed up to TTS_PREBUFFER_MS out — firing after
+        // the stop would paint a sentence that was never spoken.
+        this.turnId++;
         this.sendTtsStop();
         // Realtime-mode firmware sends `listen start` exactly once and then
         // streams the mic forever — entering Speaking never stops its audio
@@ -288,21 +309,40 @@ export class ConversationSession {
     }
   }
 
-  /** Synthesize one sentence and stream its opus frames downstream. */
+  /**
+   * Synthesize one sentence and stream its opus frames downstream. The
+   * sentence_start text is scheduled for the projected playback start of the
+   * sentence's first frame — NOT sent when the audio bytes are: frames run up
+   * to TTS_PREBUFFER_MS ahead of the speaker, and the device renders the text
+   * on receipt, so sending eagerly flashes sentence N+1 on screen while
+   * sentence N is still being spoken.
+   */
   private async speakSentence(sentence: string, turn: number): Promise<void> {
+    let announced = false;
+    const announceAt = (playsAtMs: number): void => {
+      announced = true;
+      this.sendAtPlaybackTime(buildTtsSentenceStart(sentence, this.sessionId), playsAtMs, turn);
+    };
     for await (const pcmChunk of this.providers.tts.synthesize(sentence)) {
       if (this.isStale(turn)) return;
       for (const packet of this.codec.encodeDownstreamPcm(pcmChunk)) {
         if (this.isStale(turn)) return;
-        await this.sendAudioFramePaced(packet, turn);
+        const playsAtMs = await this.sendAudioFramePaced(packet, turn);
+        if (!announced && playsAtMs !== null) announceAt(playsAtMs);
       }
     }
     // Emit this sentence's trailing partial frame so nothing is dropped and the
     // next sentence starts on a clean frame boundary.
     if (this.isStale(turn)) return;
     for (const packet of this.codec.flushDownstream()) {
-      await this.sendAudioFramePaced(packet, turn);
+      const playsAtMs = await this.sendAudioFramePaced(packet, turn);
+      if (!announced && playsAtMs !== null) announceAt(playsAtMs);
     }
+    // A sentence whose TTS yielded no audio still gets its text, once any
+    // buffered audio before it has played out. Scheduled 1ms inside the
+    // end-of-turn drain so the turn-closing turnId bump can't cancel it on an
+    // exact timer tie.
+    if (!announced && !this.isStale(turn)) announceAt(this.playbackEndsAtMs - 1);
   }
 
   /**
@@ -313,24 +353,61 @@ export class ConversationSession {
    * real-time cadence. The clock resets to "now" whenever we fall behind
    * (start of turn, or a pipeline stall drained the device), so a stall never
    * causes a catch-up burst bigger than the prebuffer.
+   *
+   * Returns the projected wall-clock ms at which this frame starts PLAYING on
+   * the device (the value sentence text is scheduled against), or null if the
+   * turn went stale and nothing was sent.
    */
-  private async sendAudioFramePaced(packet: Buffer, turn: number): Promise<void> {
+  private async sendAudioFramePaced(packet: Buffer, turn: number): Promise<number | null> {
+    // Open the speaking bracket just-in-time: the device must be in Speaking
+    // to decode opus, but entering it also starts the talking animation, so
+    // the start is held until there is audio to play. The firmware applies
+    // the state change on its main task while binary frames are checked on
+    // the receive task — give the change one frame to land or the first
+    // packet would be silently discarded.
+    if (!this.ttsBracketOpen) {
+      this.ttsBracketOpen = true;
+      this.send(buildTtsStart(this.sessionId));
+      this.send(buildLlm('neutral', this.sessionId));
+      await sleep(FRAME_DURATION_MS);
+      if (this.isStale(turn)) return null;
+    }
     // Backpressure: if the device's TCP connection stalls, ws.send() only
     // buffers — hold pacing so recovery delivers at most a prebuffer's worth
     // plus this backlog, instead of the whole stall's frames at once.
     while (this.ws.bufferedAmount > SOCKET_BACKLOG_LIMIT_BYTES) {
       await sleep(FRAME_DURATION_MS);
-      if (this.isStale(turn)) return;
+      if (this.isStale(turn)) return null;
     }
     const now = monotonicMs();
     if (this.playbackEndsAtMs < now) this.playbackEndsAtMs = now;
     const aheadMs = this.playbackEndsAtMs - now;
     if (aheadMs > TTS_PREBUFFER_MS) {
       await sleep(aheadMs - TTS_PREBUFFER_MS);
-      if (this.isStale(turn)) return;
+      if (this.isStale(turn)) return null;
     }
+    const playsAtMs = this.playbackEndsAtMs;
     this.playbackEndsAtMs += FRAME_DURATION_MS;
     this.sendBinary(packet);
+    return playsAtMs;
+  }
+
+  /**
+   * Send a control message when the device's playback clock reaches
+   * `playsAtMs`, so on-screen text tracks what is being heard rather than the
+   * (up to TTS_PREBUFFER_MS earlier) moment its audio bytes were sent. A fire
+   * after the turn ended (abort, error-path tts stop, new turn, close) is
+   * dropped by the staleness check.
+   */
+  private sendAtPlaybackTime(msg: ServerMessage, playsAtMs: number, turn: number): void {
+    const delayMs = playsAtMs - monotonicMs();
+    if (delayMs <= 0) {
+      this.send(msg);
+      return;
+    }
+    setTimeout(() => {
+      if (!this.isStale(turn)) this.send(msg);
+    }, delayMs);
   }
 
   /* ------------------------------ Helpers ------------------------------- */
