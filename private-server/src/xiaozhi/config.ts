@@ -53,6 +53,20 @@ export interface XiaozhiConfig {
      */
     timeoutMs: number;
   };
+  /** Weather tool (server-tools.ts get_weather; Open-Meteo JMA endpoint). */
+  weather: {
+    /**
+     * Location used when the user asks about the weather without naming a
+     * place ("is it going to rain tomorrow?"). Geocoded by name, so a plain
+     * city works ("Tokyo", "Osaka").
+     */
+    defaultLocation: string;
+    /**
+     * IANA timezone the forecast days are aligned to, so "tomorrow"/"Friday"
+     * mean the robot's local day rather than UTC. Japan-first: Asia/Tokyo.
+     */
+    timezone: string;
+  };
   /** Shared bootstrap token handed to the device by the OTA endpoint. */
   token: string;
   /** Server-push device events API (events.controller.ts). */
@@ -129,6 +143,10 @@ export function loadXiaozhiConfig(): XiaozhiConfig {
           'spoken aloud by the robot.',
       ),
       timeoutMs: Number(env('VISION_TIMEOUT_MS', '25000')),
+    },
+    weather: {
+      defaultLocation: env('WEATHER_DEFAULT_LOCATION', 'Tokyo'),
+      timezone: env('WEATHER_TIMEZONE', 'Asia/Tokyo'),
     },
     token: env('XIAOZHI_TOKEN', 'stackchan'),
     events: {

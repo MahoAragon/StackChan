@@ -103,7 +103,7 @@ export class XiaozhiWsService implements OnModuleDestroy {
     // (websocket_protocol.cc SetHeader) — the stable key push events address.
     const deviceId = headerValue(req.headers['device-id']) ?? `addr:${remote}`;
     const codec = new AudioCodec();
-    const tools = new ToolRegistry(createServerTools());
+    const tools = new ToolRegistry(createServerTools(this.config.weather));
     const mcp = new McpSession((payload) => {
       if (socket.readyState !== WebSocket.OPEN) {
         throw new Error('socket is not open');

@@ -195,7 +195,7 @@ TTS PCM 24 kHz == device downstream rate. Opus decode/encode uses `opusscript`
 
 All settings are environment variables with localhost defaults — see
 [`.env.example`](./.env.example) for the full list (`LLM_*`, `STT_*`, `TTS_*`,
-`XIAOZHI_TOKEN`, `PUBLIC_WS_HOST`).
+`WEATHER_*`, `XIAOZHI_TOKEN`, `PUBLIC_WS_HOST`).
 
 ```bash
 # 1. start your local llama.cpp / whisper / TTS servers (see table above)
