@@ -28,10 +28,14 @@ import { createProviders } from './ai/providers.factory';
 import type { Providers } from './ai/provider.interface';
 import { AudioCodec } from './audio/opus-codec';
 import { loadXiaozhiConfig, resolvePublicHost } from './config';
-import { ConversationSession } from './conversation';
+import {
+  ConversationSession,
+  type ServerEventPost,
+} from './conversation';
 import { McpSession } from './mcp/mcp-session';
 import {
   buildMcp,
+  buildPing,
   buildServerHello,
   encodeServerMessage,
   parseDeviceMessage,
@@ -46,6 +50,22 @@ export const XIAOZHI_WS_PATH = '/xiaozhi/v1/';
 /** The device aborts if it doesn't get our hello in 10s; drop silent clients. */
 const HELLO_TIMEOUT_MS = 10_000;
 
+/** One connected device, addressable by server-push events. */
+interface DeviceEntry {
+  /** Device-Id upgrade header (the device MAC), or an address fallback. */
+  deviceId: string;
+  sessionId: string;
+  socket: WebSocket;
+  session: ConversationSession;
+  remote: string;
+  connectedAt: number;
+}
+
+/** Outcome of addressing one push at one (possibly absent) device. */
+export type DevicePushResult =
+  | { result: ServerEventPost | 'sent'; deviceId: string }
+  | { result: 'no-device' };
+
 @Injectable()
 export class XiaozhiWsService implements OnModuleDestroy {
   private readonly logger = new Logger('XiaozhiWS');
@@ -53,6 +73,8 @@ export class XiaozhiWsService implements OnModuleDestroy {
   private readonly config = loadXiaozhiConfig();
   /** LLM/STT/TTS providers are stateless-per-turn, so build them once. */
   private readonly providers: Providers = createProviders(this.config);
+  /** Connected devices keyed by Device-Id, for server-push events. */
+  private readonly devices = new Map<string, DeviceEntry>();
 
   constructor() {
     this.wss.on('connection', (socket, req) => this.onConnection(socket, req));
@@ -77,6 +99,9 @@ export class XiaozhiWsService implements OnModuleDestroy {
     const sessionId = randomUUID();
     const remote =
       (req.socket.remoteAddress ?? '?') + ':' + (req.socket.remotePort ?? '?');
+    // The firmware sends its MAC as Device-Id on the upgrade request
+    // (websocket_protocol.cc SetHeader) — the stable key push events address.
+    const deviceId = headerValue(req.headers['device-id']) ?? `addr:${remote}`;
     const codec = new AudioCodec();
     const tools = new ToolRegistry(createServerTools());
     const mcp = new McpSession((payload) => {
@@ -93,6 +118,7 @@ export class XiaozhiWsService implements OnModuleDestroy {
       tools,
     );
 
+    let keepaliveTimer: NodeJS.Timeout | undefined;
     let helloReceived = false;
     const helloTimer = setTimeout(() => {
       if (!helloReceived) {
@@ -119,12 +145,47 @@ export class XiaozhiWsService implements OnModuleDestroy {
 
       switch (msg.type) {
         case 'hello':
-          helloReceived = true;
           clearTimeout(helloTimer);
           socket.send(encodeServerMessage(buildServerHello(sessionId)));
           this.logger.log(`Handshake complete (session=${sessionId})`);
-          if (msg.features?.mcp) {
-            void this.discoverDeviceTools(mcp, tools, req, sessionId);
+          if (!helloReceived) {
+            helloReceived = true;
+            // Only a client that completed the hello handshake becomes a
+            // push target: registering at connect time would let any stray
+            // socket (port scan, health check) receive events addressed to
+            // the robot — or, with a copied Device-Id, evict its live
+            // connection. Newest hello wins: the firmware silently discards
+            // its old WebSocket when it reconnects (no close frame), so a
+            // duplicate Device-Id means the old entry is the stale half.
+            const prev = this.devices.get(deviceId);
+            if (prev && prev.socket !== socket) {
+              this.logger.warn(
+                `Device ${deviceId} reconnected; dropping stale socket (session=${prev.sessionId})`,
+              );
+              prev.socket.terminate();
+            }
+            this.devices.set(deviceId, {
+              deviceId,
+              sessionId,
+              socket,
+              session,
+              remote,
+              connectedAt: Date.now(),
+            });
+            // Keepalive: a data frame (WS control pings don't count) every
+            // interval keeps the firmware's 120s channel timer fresh so an
+            // idle device stays reachable and awake for pushed events.
+            const keepaliveMs = this.config.events.keepaliveMs;
+            if (keepaliveMs > 0) {
+              keepaliveTimer = setInterval(() => {
+                if (socket.readyState === WebSocket.OPEN) {
+                  socket.send(encodeServerMessage(buildPing(sessionId)));
+                }
+              }, keepaliveMs);
+            }
+            if (msg.features?.mcp) {
+              void this.discoverDeviceTools(mcp, tools, req, sessionId);
+            }
           }
           break;
 
@@ -159,6 +220,12 @@ export class XiaozhiWsService implements OnModuleDestroy {
 
     socket.on('close', (code) => {
       clearTimeout(helloTimer);
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
+      // Only drop the registry entry if it is still ours: a reconnect has
+      // already replaced it with the live socket by the time ours closes.
+      if (this.devices.get(deviceId)?.socket === socket) {
+        this.devices.delete(deviceId);
+      }
       session.dispose();
       mcp.dispose();
       // Session ids are per-connection UUIDs, so this history can never be
@@ -208,6 +275,85 @@ export class XiaozhiWsService implements OnModuleDestroy {
       );
     }
   }
+
+  /* --------------------------- Server-push API ---------------------------
+   * Called by XiaozhiEventsController on behalf of external producers
+   * (desktop notifiers, email hooks, Claude Code hooks, ...). All of these
+   * resolve a target device and hand the event to its ConversationSession,
+   * which owns turn-taking (busy queueing, user preemption, tts bracketing).
+   */
+
+  /** Connected devices with their live conversation state. */
+  listDevices() {
+    return [...this.devices.values()].map((d) => ({
+      deviceId: d.deviceId,
+      sessionId: d.sessionId,
+      remote: d.remote,
+      connectedAt: new Date(d.connectedAt).toISOString(),
+      speaking: d.session.isSpeaking,
+      userTalking: d.session.isUserTalking,
+      queuedEvents: d.session.queuedEventCount,
+    }));
+  }
+
+  /** Speak `text` on the device (TTS), with an optional facial emotion. */
+  say(
+    text: string,
+    opts: { emotion?: string; deviceId?: string } = {},
+  ): DevicePushResult {
+    const device = this.resolveDevice(opts.deviceId);
+    if (!device) return { result: 'no-device' };
+    const result = device.session.postEvent({
+      kind: 'say',
+      text,
+      emotion: opts.emotion,
+    });
+    return { result, deviceId: device.deviceId };
+  }
+
+  /** Play a decoded sound (PCM16 mono 24k) on the device. */
+  playSound(
+    pcm: Buffer,
+    label: string,
+    opts: { deviceId?: string } = {},
+  ): DevicePushResult {
+    const device = this.resolveDevice(opts.deviceId);
+    if (!device) return { result: 'no-device' };
+    const result = device.session.postEvent({ kind: 'sound', pcm, label });
+    return { result, deviceId: device.deviceId };
+  }
+
+  /** Change the device's facial expression immediately (no queueing). */
+  setEmotion(
+    emotion: string,
+    opts: { deviceId?: string } = {},
+  ): DevicePushResult {
+    const device = this.resolveDevice(opts.deviceId);
+    if (!device) return { result: 'no-device' };
+    device.session.sendEmotion(emotion);
+    return { result: 'sent', deviceId: device.deviceId };
+  }
+
+  /**
+   * Exact Device-Id match when given; otherwise the newest connection — the
+   * common deployment is a single robot, and on firmware reconnect races the
+   * newest socket is the one the device is actually reading.
+   */
+  private resolveDevice(deviceId?: string): DeviceEntry | undefined {
+    if (deviceId) return this.devices.get(deviceId);
+    let newest: DeviceEntry | undefined;
+    for (const entry of this.devices.values()) {
+      if (!newest || entry.connectedAt > newest.connectedAt) newest = entry;
+    }
+    return newest;
+  }
+}
+
+/** First value of a possibly-repeated HTTP header, trimmed and non-empty. */
+function headerValue(value: string | string[] | undefined): string | undefined {
+  const first = Array.isArray(value) ? value[0] : value;
+  const trimmed = first?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /** Normalize the `ws` RawData union into a single Buffer. */

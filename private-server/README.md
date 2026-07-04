@@ -100,6 +100,7 @@ cloud. It speaks the exact WebSocket protocol the firmware enforces
 | `POST` | `/xiaozhi/ota` | Bootstrap. Returns **only** a `websocket` block (URL + token) and no `mqtt`/`firmware`/`activation`, so the device selects WebSocket and skips cloud activation/upgrade. |
 | `WS`   | `/xiaozhi/v1/` | Realtime conversation: Opus in (16 kHz) → STT → LLM → TTS → Opus out (24 kHz), plus the tunneled MCP control layer (tool discovery + calls). |
 | `POST` | `/xiaozhi/vision/explain` | Camera photo upload (multipart `question` + `file`). The device gets this URL via MCP `initialize`; the response body is returned verbatim to the LLM as the take_photo tool result. |
+| `POST`/`GET` | `/xiaozhi/events/*` | Server-push events: make an idle device speak, change expression, or play a sound (see below). |
 
 Per-utterance flow: the device brackets speech with `listen start` / `listen
 stop`; on stop we decode the upstream Opus to PCM, transcribe it (STT), stream
@@ -120,8 +121,10 @@ Two kinds share one registry, so the model sees a single flat function list:
   [`src/xiaozhi/mcp/mcp-session.ts`](./src/xiaozhi/mcp/mcp-session.ts)):
   `initialize` hands the device the vision-upload URL + token, `tools/list`
   discovers what the firmware exposes (`self.camera.take_photo`,
-  `self.robot.set_head_angles`, `self.robot.set_led_color`, reminders, volume,
-  …), and each LLM call becomes a `tools/call` round-trip. MCP names are
+  `self.robot.set_head_angles`, `self.robot.set_led_color`,
+  `self.robot.go_to_sleep` — "stop listening" / "go away" sends the robot to
+  standby — reminders, volume, …), and each LLM call becomes a `tools/call`
+  round-trip. MCP names are
   dotted; they are exposed to the model with underscores
   (`self_camera_take_photo`) and mapped back on execution.
 
@@ -130,6 +133,45 @@ Two kinds share one registry, so the model sees a single flat function list:
 photo (showing it on the LCD) and POSTs it to `/xiaozhi/vision/explain` → the
 vision model answers the LLM's question about it → the reply is spoken. The
 photo never leaves your LAN.
+
+### Server-push events (notifications)
+
+External producers — desktop notifiers, email hooks, a Claude Code hook that
+fires when a prompt finishes — can push events to the device through
+[`src/xiaozhi/events.controller.ts`](./src/xiaozhi/events.controller.ts). The
+device keeps its conversation WebSocket open while idle (the server sends a
+JSON keepalive so the firmware's 120 s channel timer never lapses), so no
+polling and no firmware changes are involved.
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| `POST` | `/xiaozhi/events/say` | `{"text", "emotion"?, "deviceId"?}` | Speak `text` via TTS with the normal talking animation + speech bubble. |
+| `POST` | `/xiaozhi/events/emotion` | `{"emotion", "deviceId"?}` | Change the facial expression immediately (`neutral`, `happy`, `laughing`, `angry`, `sad`, `crying`, `sleepy`, `doubtful`). |
+| `POST` | `/xiaozhi/events/sound` | `{"name", "deviceId"?}` or multipart `file=<wav>` | Play a WAV (any rate/channels; decoded + resampled server-side). Named sounds live in [`sounds/`](./sounds). |
+| `GET`  | `/xiaozhi/events/devices` | — | Connected devices + live state (speaking, queued events). |
+| `GET`  | `/xiaozhi/events/sounds` | — | Named sounds available to `POST …/sound`. |
+
+Every route requires `Authorization: Bearer $XIAOZHI_EVENTS_TOKEN`, and this
+token **is enforced** (unset = API disabled with 503) — the API speaks
+arbitrary text on a robot in your home.
+
+```bash
+curl -X POST http://localhost:12800/xiaozhi/events/say \
+  -H "Authorization: Bearer $XIAOZHI_EVENTS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Claude finished processing your prompt.", "emotion": "happy"}'
+```
+
+Delivery semantics: a quiet device plays the event after a short quiet grace
+(`EVENT_QUIET_GRACE_MS`, default 2 s of no conversation activity); if it is
+speaking or the user is interacting, the event waits in a bounded FIFO
+(`"queued"`, 429 when full) and plays when the turn ends. The user wins:
+interrupting the robot (wake word / tap — anything that makes the device send
+`listen start` or `abort`) cancels an in-flight event just like it cancels a
+normal reply, and the quiet grace keeps the next event from starting over the
+user's first words. Responses report acceptance, not completion: producers
+fire and forget. `deviceId` (the device MAC, see `GET …/devices`) is only
+needed with multiple robots; otherwise the newest connection is targeted.
 
 ### Required local servers (OpenAI-compatible, no cloud keys)
 
@@ -176,6 +218,8 @@ curl -X POST http://localhost:12800/xiaozhi/ota
 npm run sim          # no AI servers needed: hello handshake + MCP initialize/tools/list
 npm run e2e          # full turn through all 3 services: mic Opus -> STT -> LLM -> TTS -> Opus
 npm run e2e:vision   # "what can you see": full turn + MCP camera emulation + photo upload
+npm run e2e:events   # server-push events: auth, emotion, sounds, queueing, preemption, say
+npm run e2e:sleep    # "go away": the LLM calls self.robot.go_to_sleep and says goodbye
 ```
 
 `npm run e2e` emulates the device end-to-end: it speaks a prompt (auto-generated
@@ -190,6 +234,18 @@ camera: it answers `initialize`/`tools/list`, and when the LLM calls
 vision endpoint exactly the way `StackChanCamera::Explain` does (chunked
 multipart + bearer token), then asserts the reply audio describes it. Needs a
 tool-capable, multimodal model behind the LLM/vision endpoints.
+
+`npm run e2e:sleep` emulates the firmware's MCP server with the
+`self.robot.go_to_sleep` tool (see `firmware/main/hal/hal_mcp.cpp` — the two
+descriptions must stay in sync) and speaks dismissal phrases ("go away", "stop
+listening", "go to sleep"), asserting the LLM calls the tool and finishes the
+goodbye turn. Needs a tool-capable model behind the LLM endpoint.
+
+`npm run e2e:events` emulates an idle device and drives the events API against
+it. Needs only private-server, started for the test as
+`PORT=12900 XIAOZHI_EVENTS_TOKEN=test-token XIAOZHI_KEEPALIVE_MS=1500 npm run
+start:prod` (the `say` playback assertions are skipped when no TTS backend is
+running). Override with `BASE_URL` / `EVENTS_TOKEN`.
 
 ## Point the firmware at this server, build & flash
 

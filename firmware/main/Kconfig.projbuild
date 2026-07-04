@@ -23,6 +23,19 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config STACKCHAN_PERSISTENT_CHANNEL
+    bool "Keep the server audio channel open while idle (StackChan)"
+    default y
+    help
+        Auto-(re)open the xiaozhi WebSocket whenever the device is idle with
+        the network up, so the private server can push events (speak,
+        expression, sounds) at any time — after boot, after the user taps a
+        chat closed, and after network blips. Connects with exponential
+        backoff (5s..300s) and never changes the device state. Expects the
+        server to send its JSON keepalive (private-server default) so the
+        idle channel is not considered timed out. Disable to restore the
+        stock connect-on-interaction behavior.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

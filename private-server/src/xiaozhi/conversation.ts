@@ -35,6 +35,7 @@ import { pcm16ToWav } from './audio/wav';
 import type { Providers, ToolSource } from './ai/provider.interface';
 import {
   FRAME_DURATION_MS,
+  FRAME_SAMPLES_OUT,
   SAMPLE_RATE_IN,
   buildLlm,
   buildStt,
@@ -108,6 +109,42 @@ const MAX_UTTERANCE_FRAMES = Math.max(1, Math.round(MAX_UTTERANCE_MS / FRAME_DUR
 const VAD_MIN_SPEECH_FRAMES = 5; // ~300ms of speech before silence may end a turn
 const LOG_EVERY_FRAMES = 50; // ~3s heartbeat while listening
 
+/**
+ * Server events waiting for a quiet moment (bounded so a runaway producer
+ * can't build an hour-long backlog the robot then dutifully recites).
+ */
+const SERVER_EVENT_QUEUE_MAX = 8;
+
+/**
+ * How long the conversation must have been quiet (no reply playing, no user
+ * speech, no listen/abort control traffic) before a queued server event may
+ * start. Closes the race where an event fires in the instant between the
+ * user starting to interact and the VAD registering their voice (~2 frames),
+ * and keeps notifications from slamming in the moment a reply ends.
+ */
+const EVENT_QUIET_GRACE_MS = Number(process.env.EVENT_QUIET_GRACE_MS ?? 2000);
+
+/** Sentence boundaries shared by the LLM-delta splitter and fixed-text events. */
+const SENTENCE_BOUNDARY = /(?<=[.!?。！？\n])/;
+
+/**
+ * A server-initiated event played over the conversation socket: speak text
+ * via TTS, or play a pre-decoded sound (PCM16 mono 24k). Both ride the same
+ * tts start/stop bracket as a normal reply because the firmware only decodes
+ * downstream opus in the Speaking state — which also means the device runs
+ * its talking animation for sounds; that is a firmware constraint, not a
+ * choice. Expression-only pushes don't queue (see sendEmotion).
+ */
+export type ServerEvent =
+  | { kind: 'say'; text: string; emotion?: string }
+  | { kind: 'sound'; pcm: Buffer; label: string };
+
+/** Immediate outcome of posting a server event (delivery is asynchronous). */
+export type ServerEventPost = 'playing' | 'queued' | 'queue-full';
+
+/** Final outcome of one delivered server event. */
+export type ServerEventResult = 'completed' | 'preempted' | 'failed';
+
 export class ConversationSession {
   private readonly logger = new Logger('XiaozhiConv');
 
@@ -158,6 +195,24 @@ export class ConversationSession {
    */
   private ttsBracketOpen = false;
 
+  /**
+   * Emotion sent in the llm frame when this turn's tts bracket opens. Normal
+   * turns use 'neutral' (the LLM has no emotion channel yet); say-events carry
+   * their requested emotion; sound-events set null to leave the face alone.
+   */
+  private bracketEmotion: string | null = 'neutral';
+
+  /** Server events awaiting a quiet gap in the conversation (FIFO). */
+  private pendingEvents: ServerEvent[] = [];
+  /** True while the drain loop below is delivering queued events. */
+  private drainingEvents = false;
+  /**
+   * Monotonic ms of the last conversation activity (listen/abort control
+   * frames, detected user speech, end of a reply). Server events wait until
+   * this is at least EVENT_QUIET_GRACE_MS in the past.
+   */
+  private lastActivityAtMs = 0;
+
   constructor(
     private readonly ws: WebSocket,
     private readonly codec: AudioCodec,
@@ -169,10 +224,78 @@ export class ConversationSession {
 
   /* ------------------------------ Control ------------------------------- */
 
+  /** True while a reply or server event is being spoken. */
+  get isSpeaking(): boolean {
+    return this.speaking;
+  }
+
+  /** True while the mic is being buffered (always true in realtime mode). */
+  get isListening(): boolean {
+    return this.listening;
+  }
+
+  /**
+   * True while an utterance with detected speech is in flight. Plain
+   * `listening` must not gate server events: realtime-mode firmware streams
+   * the mic forever, so the session is "listening" even when nobody talks.
+   */
+  get isUserTalking(): boolean {
+    return this.listening && this.sawSpeech;
+  }
+
+  /** Server events still waiting to be delivered. */
+  get queuedEventCount(): number {
+    return this.pendingEvents.length;
+  }
+
+  /**
+   * True when a server event must not start: a reply/event is being spoken,
+   * the user is audibly talking, or a device-initiated listen window is open.
+   * The window check is mode-aware: auto/manual arm listening only when the
+   * user explicitly asked to talk (an event would hijack their utterance),
+   * while realtime keeps listening forever, so there it cannot gate and
+   * `isUserTalking` + the quiet grace carry the load.
+   */
+  private get busyForEvents(): boolean {
+    return (
+      this.speaking ||
+      this.isUserTalking ||
+      (this.listening && this.listenMode !== 'realtime')
+    );
+  }
+
+  /**
+   * Queue a server-initiated event (notification speech, a sound). Delivered
+   * once the conversation has been quiet for EVENT_QUIET_GRACE_MS; a busy
+   * session (speaking, user talking, or an armed listen window) delivers it
+   * when the turn ends. The user wins mid-delivery too: anything that makes
+   * the device send `listen start` or `abort` (wake word, tap) cancels an
+   * in-flight event exactly like it cancels a normal reply.
+   */
+  postEvent(event: ServerEvent): ServerEventPost {
+    if (this.pendingEvents.length >= SERVER_EVENT_QUEUE_MAX) return 'queue-full';
+    this.pendingEvents.push(event);
+    if (this.drainingEvents || this.busyForEvents) {
+      return 'queued';
+    }
+    void this.drainServerEvents();
+    return 'playing';
+  }
+
+  /**
+   * Push an expression change immediately, whatever the device is doing —
+   * the firmware applies llm frames in any state. Transient by design: the
+   * next spoken turn/event opens with its own emotion frame.
+   */
+  sendEmotion(emotion: string): void {
+    this.send(buildLlm(emotion, this.sessionId));
+  }
+
   /** listen state=start | detect — begin a fresh utterance. */
   onListenStart(mode?: string): void {
     // A new utterance supersedes anything we might still be saying.
     this.abort();
+    this.lastActivityAtMs = monotonicMs();
     this.listenMode = mode ?? 'auto';
     this.rearmListening();
     this.logger.log(`Listening started (mode=${this.listenMode})`);
@@ -201,6 +324,7 @@ export class ConversationSession {
   abort(): void {
     this.listening = false;
     this.pcmChunks = [];
+    this.lastActivityAtMs = monotonicMs();
     if (this.speaking) {
       // Bump the turn id so the streaming loop stops, then close out the tts
       // bracket the device is expecting.
@@ -208,6 +332,10 @@ export class ConversationSession {
       this.speaking = false;
       this.sendTtsStop();
     }
+    // A standalone abort (wake-word tap that leads nowhere) may be the last
+    // signal for a while — don't strand queued events behind it. The drain's
+    // quiet grace keeps this from talking over the turn that usually follows.
+    this.maybeDrainServerEvents();
   }
 
   /** Called when the socket closes so no async loop keeps sending. */
@@ -216,6 +344,7 @@ export class ConversationSession {
     this.listening = false;
     this.speaking = false;
     this.pcmChunks = [];
+    this.pendingEvents = [];
   }
 
   /* --------------------------- Upstream audio --------------------------- */
@@ -262,6 +391,7 @@ export class ConversationSession {
         this.sawSpeech = true;
         this.speechFrames++;
         this.silenceFrames = 0;
+        this.lastActivityAtMs = monotonicMs();
       }
       // else: an isolated spike — don't reset the silence run for it.
     } else {
@@ -300,10 +430,13 @@ export class ConversationSession {
   private endUtterance(trigger: string): void {
     if (!this.listening) return;
     this.listening = false;
+    this.lastActivityAtMs = monotonicMs();
     const pcm = Buffer.concat(this.pcmChunks);
     this.pcmChunks = [];
     if (pcm.length === 0) {
       this.logger.warn(`Utterance ended (${trigger}) with no audio; ignoring`);
+      // No turn will run, so nothing else re-kicks queued server events.
+      this.maybeDrainServerEvents();
       return;
     }
     const secs = (pcm.length / 2 / SAMPLE_RATE_IN).toFixed(1);
@@ -321,6 +454,7 @@ export class ConversationSession {
     this.codec.resetDownstream();
     this.playbackEndsAtMs = 0;
     this.ttsBracketOpen = false;
+    this.bracketEmotion = 'neutral';
 
     try {
       const wav = pcm16ToWav(pcm, SAMPLE_RATE_IN);
@@ -384,8 +518,137 @@ export class ConversationSession {
         // (application.cc). Re-arm ourselves or the session goes deaf after
         // the first turn.
         if (this.listenMode === 'realtime') this.rearmListening();
+        // The turn is over — deliver any server events that queued behind it
+        // (after the quiet grace, so they don't slam in as the reply ends).
+        this.lastActivityAtMs = monotonicMs();
+        this.maybeDrainServerEvents();
       }
     }
+  }
+
+  /* --------------------------- Server events ---------------------------- */
+
+  /** Kick the event queue unless the session is busy or already draining. */
+  private maybeDrainServerEvents(): void {
+    if (this.pendingEvents.length === 0 || this.drainingEvents) return;
+    if (this.busyForEvents) return;
+    void this.drainServerEvents();
+  }
+
+  /**
+   * Deliver queued server events one at a time until the queue is empty or a
+   * user turn takes over (that turn's finally re-kicks the drain). Never runs
+   * concurrently with itself (`drainingEvents`), and posting while a delivery
+   * is in flight just extends the queue this loop is already consuming.
+   *
+   * Every delivery waits for EVENT_QUIET_GRACE_MS of conversation silence
+   * first. This is what makes a preemption final: right after a barge-in the
+   * VAD hasn't seen speech yet (sawSpeech lags by the debounce), so without
+   * the grace this loop would start the next event over the user's opening
+   * words.
+   */
+  private async drainServerEvents(): Promise<void> {
+    this.drainingEvents = true;
+    try {
+      while (this.pendingEvents.length > 0) {
+        if (this.ws.readyState !== WebSocket.OPEN) {
+          this.pendingEvents = [];
+          return;
+        }
+        if (this.busyForEvents) return; // re-kicked when the turn ends
+        const quietForMs = monotonicMs() - this.lastActivityAtMs;
+        if (quietForMs < EVENT_QUIET_GRACE_MS) {
+          await sleep(EVENT_QUIET_GRACE_MS - quietForMs);
+          continue; // re-check busy/quiet — activity may have resumed
+        }
+        const event = this.pendingEvents.shift();
+        if (!event) return;
+        const label =
+          event.kind === 'say'
+            ? `say "${truncateForLog(event.text)}"`
+            : `sound "${event.label}"`;
+        this.logger.log(`Server event: ${label}`);
+        const result = await this.runServerEvent(event);
+        this.logger.log(`Server event ${result}: ${label}`);
+        // On preemption loop around rather than bail: the busy/quiet checks
+        // yield to whatever interrupted us, and if it was a lone abort (no
+        // turn follows to re-kick), the remaining events still drain.
+      }
+    } finally {
+      this.drainingEvents = false;
+    }
+  }
+
+  /**
+   * Play one server event as its own tts-bracketed pseudo-turn, reusing the
+   * turn machinery (just-in-time bracket, pacing, backpressure, staleness) so
+   * pushed speech is indistinguishable from a reply and the device can never
+   * be left stuck in Speaking.
+   */
+  private async runServerEvent(event: ServerEvent): Promise<ServerEventResult> {
+    const turn = ++this.turnId;
+    this.speaking = true;
+    // Realtime-mode firmware streams the mic even while we speak; drop those
+    // frames during the event and re-arm below, exactly like runTurn does for
+    // replies. Mid-event preemption therefore comes from device control
+    // frames (`listen start`/`abort` — wake word, tap), not from raw speech,
+    // the same contract normal replies have.
+    this.listening = false;
+    this.codec.resetDownstream();
+    this.playbackEndsAtMs = 0;
+    this.ttsBracketOpen = false;
+    this.bracketEmotion =
+      event.kind === 'say' ? (event.emotion ?? 'neutral') : null;
+
+    let outcome: ServerEventResult = 'completed';
+    try {
+      if (event.kind === 'say') {
+        for (const sentence of splitIntoSentences(event.text)) {
+          if (this.isStale(turn)) break;
+          await this.speakSentence(sentence, turn);
+        }
+      } else {
+        // Encode incrementally, a chunk ahead of the paced sends — encoding
+        // a long WAV in one synchronous pass would block the event loop for
+        // the whole file before its first frame leaves.
+        const chunkBytes = FRAME_SAMPLES_OUT * 2 * 10; // ~600ms of PCM
+        for (
+          let off = 0;
+          off < event.pcm.length && !this.isStale(turn);
+          off += chunkBytes
+        ) {
+          const chunk = event.pcm.subarray(off, off + chunkBytes);
+          for (const packet of this.codec.encodeDownstreamPcm(chunk)) {
+            if (this.isStale(turn)) break;
+            await this.sendAudioFramePaced(packet, turn);
+          }
+        }
+        if (!this.isStale(turn)) {
+          for (const packet of this.codec.flushDownstream()) {
+            await this.sendAudioFramePaced(packet, turn);
+          }
+        }
+      }
+      // Drain the buffered tail so the bracket tracks real sound (see runTurn).
+      if (!this.isStale(turn)) {
+        const tailMs = this.playbackEndsAtMs - monotonicMs();
+        if (tailMs > 0) await sleep(tailMs);
+      }
+    } catch (err) {
+      outcome = 'failed';
+      this.logger.error(`Server event failed: ${asMessage(err)}`);
+    } finally {
+      if (this.isStale(turn)) {
+        // A user turn/abort superseded us and already sent its own tts stop.
+        if (outcome !== 'failed') outcome = 'preempted';
+      } else {
+        this.speaking = false;
+        this.turnId++;
+        this.sendTtsStop();
+        if (this.listenMode === 'realtime') this.rearmListening();
+      }
+    }
+    return outcome;
   }
 
   /**
@@ -447,7 +710,9 @@ export class ConversationSession {
     if (!this.ttsBracketOpen) {
       this.ttsBracketOpen = true;
       this.send(buildTtsStart(this.sessionId));
-      this.send(buildLlm('neutral', this.sessionId));
+      if (this.bracketEmotion !== null) {
+        this.send(buildLlm(this.bracketEmotion, this.sessionId));
+      }
       await sleep(FRAME_DURATION_MS);
       if (this.isStale(turn)) return null;
     }
@@ -507,7 +772,7 @@ export class ConversationSession {
     for await (const delta of deltas) {
       buf += delta;
       // Flush on sentence-ending punctuation (latin + CJK) or newlines.
-      const parts = buf.split(/(?<=[.!?。！？\n])/);
+      const parts = buf.split(SENTENCE_BOUNDARY);
       buf = parts.pop() ?? '';
       for (const part of parts) {
         const s = part.trim();
@@ -535,6 +800,18 @@ export class ConversationSession {
 
 function asMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Split fixed event text on the same boundaries as the streaming splitter. */
+function splitIntoSentences(text: string): string[] {
+  return text
+    .split(SENTENCE_BOUNDARY)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function truncateForLog(text: string, max = 60): string {
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
 function sleep(ms: number): Promise<void> {

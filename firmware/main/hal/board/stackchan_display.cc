@@ -267,6 +267,12 @@ void StackChanAvatarDisplay::SetupUI()
     });
 
     stackchan.attachAvatar(std::move(avatar));
+
+    // On boot-to-agent paths (startAiAgentOnBoot, single-app auto-open) the
+    // launcher view never gets created, so the boot logo would outlive boot.
+    // The avatar has replaced it on screen now, destroy it here.
+    GetHAL().bootLogo.reset();
+
     stackchan.addModifier(std::make_unique<BreathModifier>());
     blink_modifier_id_ = stackchan.addModifier(std::make_unique<BlinkModifier>());
     stackchan.addModifier(std::make_unique<HeadPetModifier>());

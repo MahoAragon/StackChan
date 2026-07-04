@@ -133,7 +133,10 @@ Source: [`mcp_server.cc`](../xiaozhi-esp32/main/mcp_server.cc),
   (`mcp_server.cc:33-301`).
 - **StackChan registers its own robot tools** in `hal_mcp.cpp`:
   `self.robot.set_head_angles`, `self.robot.get_head_angles`, `self.robot.set_led_color`,
-  `self.robot.create_reminder` / `get_reminders` / `stop_reminder` (`hal_mcp.cpp:16-149`).
+  `self.robot.create_reminder` / `get_reminders` / `stop_reminder`, and
+  `self.robot.go_to_sleep` ("stop listening" / "go away": ends the conversation
+  and returns the device to Idle standby via `Application::ReturnToIdle()`;
+  the wake word or a tap wakes it again).
   This is how the LLM physically drives the StackChan.
 
 ---

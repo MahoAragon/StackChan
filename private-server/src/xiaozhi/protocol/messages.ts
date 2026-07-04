@@ -97,6 +97,19 @@ export interface LlmMessage {
   text?: string;
 }
 
+/**
+ * server -> device: idle keepalive. Only TEXT/BINARY data frames refresh the
+ * firmware's 120s channel timer (protocol.cc IsTimeout / last_incoming_time_ —
+ * WebSocket control pings don't reach that path), and once the timer lapses
+ * the device believes the channel is closed and may enter light sleep, where
+ * server-pushed events stall. The firmware logs "Unknown message type: ping"
+ * and otherwise ignores this frame.
+ */
+export interface ServerPingMessage {
+  type: 'ping';
+  session_id?: string;
+}
+
 /** Any control frame the device may send us. */
 export type DeviceMessage =
   | ClientHelloMessage
@@ -110,7 +123,8 @@ export type ServerMessage =
   | TtsMessage
   | SttMessage
   | LlmMessage
-  | McpMessage;
+  | McpMessage
+  | ServerPingMessage;
 
 /* ----------------------------- Frame builders ----------------------------- */
 
@@ -157,6 +171,11 @@ export function buildStt(text: string, sessionId?: string): SttMessage {
 /** Report assistant emotion/metadata to drive the avatar. */
 export function buildLlm(emotion: string, sessionId?: string): LlmMessage {
   return { type: 'llm', emotion, session_id: sessionId };
+}
+
+/** Keepalive that refreshes the device's channel timer (see ServerPingMessage). */
+export function buildPing(sessionId?: string): ServerPingMessage {
+  return { type: 'ping', session_id: sessionId };
 }
 
 /**

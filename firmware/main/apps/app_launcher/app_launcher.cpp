@@ -69,6 +69,22 @@ void AppLauncher::onLauncherDestroy()
 
 void AppLauncher::create_launcher_view()
 {
+    // With a single app registered, enter it directly instead of showing a
+    // one-icon menu. Only on cold boot: warm reboots (and the app closing back
+    // to the launcher) must still reach the menu, or the user could never
+    // leave the app.
+    if (!_auto_open_checked) {
+        _auto_open_checked = true;
+        if (GetHAL().getWarmRebootTarget() < 0) {
+            auto app_props = getAppProps();
+            if (app_props.size() == 1 && openApp(app_props.front().appID)) {
+                mclog::tagInfo(getAppInfo().name, "single app registered, open it directly, app id: {}",
+                               app_props.front().appID);
+                return;
+            }
+        }
+    }
+
     _view = std::make_unique<view::LauncherView>();
     _view->init(getAppProps());
     _view->onAppClicked = [&](int appID) {

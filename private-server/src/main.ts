@@ -63,6 +63,7 @@ async function bootstrap() {
   logger.log(`  Device API: GET /stackChan/device/user|info, POST /stackChan/device/unbind, GET /stackChan/apps`);
   logger.log(`  Dev push  : POST /control/{avatar,motion,dance,text,call/request,...}`);
   logger.log(`  Xiaozhi   : POST /xiaozhi/ota (bootstrap), WS ws://<host>:${PORT}${XIAOZHI_WS_PATH} (AI conversation), POST /xiaozhi/vision/explain (camera photos)`);
+  logger.log(`  Events    : POST /xiaozhi/events/{say,emotion,sound}, GET /xiaozhi/events/{devices,sounds} (Bearer XIAOZHI_EVENTS_TOKEN)`);
 }
 
 bootstrap();

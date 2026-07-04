@@ -6,6 +6,7 @@
 #include "hal.h"
 #include <mooncake_log.h>
 #include <mcp_server.h>
+#include <application.h>
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
 
@@ -145,5 +146,17 @@ void Hal::xiaozhi_mcp_init()
                            mclog::tagInfo(_tag, "stop_reminder: id={}", id);
                            tools::stop_reminder(id);
                            return true;
+                       });
+
+    mclog::tagInfo(_tag, "add robot.go_to_sleep tool");
+    mcp_server.AddTool("self.robot.go_to_sleep",
+                       "Stop listening and go to standby. Use when the user dismisses you or asks for quiet: "
+                       "'go away', 'stop listening', 'go to sleep', 'rest now', 'be quiet', 'that's all'. "
+                       "Say a one-sentence goodbye in the same reply; it is spoken before standby, and the "
+                       "wake word or a tap wakes you again.",
+                       std::vector<Property>{}, [](const PropertyList& properties) -> ReturnValue {
+                           mclog::tagInfo(_tag, "go_to_sleep");
+                           Application::GetInstance().ReturnToIdle();
+                           return "Going to standby once this reply is spoken.";
                        });
 }

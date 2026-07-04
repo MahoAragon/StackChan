@@ -11,7 +11,9 @@
     "start:prod": "node dist/main.js",
     "sim": "node scripts/sim-device.mjs",
     "e2e": "node scripts/e2e-turn.cjs",
-    "e2e:vision": "node scripts/e2e-vision.cjs"
+    "e2e:vision": "node scripts/e2e-vision.cjs",
+    "e2e:events": "node scripts/e2e-events.cjs",
+    "e2e:sleep": "node scripts/e2e-sleep.cjs"
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",

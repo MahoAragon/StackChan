@@ -55,6 +55,27 @@ export interface XiaozhiConfig {
   };
   /** Shared bootstrap token handed to the device by the OTA endpoint. */
   token: string;
+  /** Server-push device events API (events.controller.ts). */
+  events: {
+    /**
+     * Bearer token external producers (hooks, notifiers) must present.
+     * Empty = the events API is disabled. Unlike the advisory device tokens
+     * above, this one IS enforced: the endpoint makes the robot speak
+     * arbitrary text.
+     */
+    token: string;
+    /** Directory of named notification sounds (WAV), relative to the CWD. */
+    soundsDir: string;
+    /**
+     * Period of the JSON keepalive sent to idle device sockets; 0 disables.
+     * Must stay well under 120000: the firmware marks the channel dead after
+     * 120s without a data frame (protocol.cc IsTimeout) and may light-sleep.
+     * The default gives a 3-missed-frame margin. Side effect while connected:
+     * the device never enters light sleep / battery power-off — notification
+     * targets should run docked.
+     */
+    keepaliveMs: number;
+  };
 }
 
 /** Dummy key for local OpenAI-compatible servers that don't check auth. */
@@ -110,6 +131,11 @@ export function loadXiaozhiConfig(): XiaozhiConfig {
       timeoutMs: Number(env('VISION_TIMEOUT_MS', '25000')),
     },
     token: env('XIAOZHI_TOKEN', 'stackchan'),
+    events: {
+      token: env('XIAOZHI_EVENTS_TOKEN', ''),
+      soundsDir: env('XIAOZHI_SOUNDS_DIR', 'sounds'),
+      keepaliveMs: Number(env('XIAOZHI_KEEPALIVE_MS', '30000')),
+    },
   };
 }
 
