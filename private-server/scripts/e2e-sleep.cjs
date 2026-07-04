@@ -4,19 +4,21 @@
  *
  * Emulates the firmware device — including its MCP server with the
  * self.robot.go_to_sleep tool (firmware/main/hal/hal_mcp.cpp) — and verifies
- * that dismissal phrases make the LLM call the tool, for each phrase in a
- * fresh session:
+ * that dismissal phrases make the LLM call the tool AND stay silent (no
+ * goodbye, no spoken reply), for each phrase in a fresh session:
  *   hello -> MCP initialize/tools/list (we advertise go_to_sleep + a
  *   distractor tool) -> listen start -> upstream Opus ("go away") -> listen
  *   stop -> STT -> LLM calls self.robot.go_to_sleep -> we reply like the
  *   firmware AND send the `listen stop` the real device's ReturnToIdle()
- *   emits mid-turn (the server must tolerate it) -> goodbye TTS -> tts stop.
- * Each goodbye is re-transcribed via whisper as a round-trip check.
+ *   emits mid-turn (the server must tolerate it) -> NO reply text/TTS ->
+ *   tts stop (the server closes the bracket even for a silent turn).
+ * The test asserts the turn produced no spoken audio at all.
  *
  * On the real device the tool call drives Application::ReturnToIdle()
- * (firmware/xiaozhi-esp32/main/application.cc): Listening -> Idle right away,
- * Speaking -> Idle after the goodbye. This test covers everything up to that
- * boundary — the LLM's decision and the server's handling of the turn.
+ * (firmware/xiaozhi-esp32/main/application.cc): from Listening it drops to
+ * Idle right away — and since dismissal speaks nothing, there is no Speaking
+ * phase to wait out. This test covers everything up to that boundary — the
+ * LLM's decision and the server's handling of the turn.
  *
  * Prerequisites — all must be running (see .env / docker-compose.yml):
  *   - private-server          (npm run start:prod)      ws://127.0.0.1:12800
@@ -58,8 +60,8 @@ const DEVICE_TOOLS = [
     description:
       "Stop listening and go to standby. Use when the user dismisses you or asks for quiet: " +
       "'go away', 'stop listening', 'go to sleep', 'rest now', 'be quiet', 'that's all'. " +
-      "Say a one-sentence goodbye in the same reply; it is spoken before standby, and the " +
-      "wake word or a tap wakes you again.",
+      "Do NOT say anything: produce no spoken reply at all, not even a short goodbye. Just " +
+      "call this tool with no accompanying text. The wake word or a tap wakes you again.",
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -125,7 +127,7 @@ function runSession(prompt, frames) {
       // (ConversationSession.endUtterance early return) is exercised too.
       ws.send(JSON.stringify({ type: 'listen', state: 'stop' }));
       mcpReply(id, {
-        content: [{ type: 'text', text: 'Going to standby once this reply is spoken.' }],
+        content: [{ type: 'text', text: 'Going to standby now, silently.' }],
         isError: false,
       });
     } else if (method === 'tools/call' && params?.name === 'self.robot.set_head_angles') {
@@ -204,13 +206,21 @@ async function main() {
     ensureInputWav(wavPath, prompt);
     console.log(`\n[sim] "${prompt}"`);
     const st = await runSession(prompt, wavToOpusFrames(wavPath));
-    const heard = await retranscribe(st.opus);
     console.log('  STT (user said):', JSON.stringify(st.stt));
-    console.log('  goodbye        :', JSON.stringify(st.sentences.join(' ')));
-    console.log('  whisper reheard:', JSON.stringify(heard));
+    const silent = !st.ttsStart && st.sentences.length === 0 && st.opus.length === 0;
+    if (silent) {
+      console.log('  spoken reply   : (none — silent dismissal)');
+    } else {
+      // Something leaked: surface exactly what the robot said so the failure is
+      // actionable (a chatty model emitting a goodbye despite the instruction).
+      const heard = await retranscribe(st.opus);
+      console.log('  LEAKED reply   :', JSON.stringify(st.sentences.join(' ')));
+      console.log('  whisper reheard:', JSON.stringify(heard));
+    }
     const checks = {
       'tools/list answered': st.toolsListed,
       'LLM called self.robot.go_to_sleep': st.sleepCalls > 0,
+      'no spoken reply (silent dismissal)': silent,
       'turn completed (tts stop)': st.ttsStop,
     };
     // Informational, not gating: a stray head move is model noise, not a bug.

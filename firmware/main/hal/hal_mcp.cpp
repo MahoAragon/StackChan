@@ -152,11 +152,11 @@ void Hal::xiaozhi_mcp_init()
     mcp_server.AddTool("self.robot.go_to_sleep",
                        "Stop listening and go to standby. Use when the user dismisses you or asks for quiet: "
                        "'go away', 'stop listening', 'go to sleep', 'rest now', 'be quiet', 'that's all'. "
-                       "Say a one-sentence goodbye in the same reply; it is spoken before standby, and the "
-                       "wake word or a tap wakes you again.",
+                       "Do NOT say anything: produce no spoken reply at all, not even a short goodbye. Just "
+                       "call this tool with no accompanying text. The wake word or a tap wakes you again.",
                        std::vector<Property>{}, [](const PropertyList& properties) -> ReturnValue {
                            mclog::tagInfo(_tag, "go_to_sleep");
                            Application::GetInstance().ReturnToIdle();
-                           return "Going to standby once this reply is spoken.";
+                           return "Going to standby now, silently.";
                        });
 }

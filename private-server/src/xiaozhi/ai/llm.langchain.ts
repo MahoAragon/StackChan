@@ -110,6 +110,10 @@ export class LangChainLlmProvider implements LlmProvider {
         parameters: t.parameters,
       },
     }));
+    // Silent tools (dismissal) end the turn with no spoken reply — see below.
+    const silentTools = new Set(
+      specs.filter((t) => t.silent).map((t) => t.name),
+    );
     let streamModel = specs.length ? this.model.bindTools(toolDefs) : this.model;
     let fallbackModel = specs.length
       ? this.modelNoStream.bindTools(toolDefs)
@@ -174,6 +178,7 @@ export class LangChainLlmProvider implements LlmProvider {
           continue;
         }
 
+        let calledSilentTool = false;
         for (const tc of toolCalls) {
           // The user interrupted (or the socket died): do not drive the robot
           // any further. History is discarded by the commit guard below.
@@ -184,8 +189,17 @@ export class LangChainLlmProvider implements LlmProvider {
             `Tool result: ${tc.name} -> ${result.slice(0, 200)}${result.length > 200 ? '…' : ''}`,
           );
           history.push(toolResult(tc, result));
+          if (silentTools.has(tc.name)) calledSilentTool = true;
         }
         if (superseded()) return;
+        // A silent tool (dismissal) ends the turn here: skipping the next hop
+        // means the model never gets to speak a goodbye, so the robot just
+        // goes quiet. The tool has already run — e.g. go_to_sleep drove the
+        // firmware's ReturnToIdle — so nothing else is owed for this turn.
+        if (calledSilentTool) {
+          this.logger.log('Silent tool called; ending turn with no reply');
+          return;
+        }
       }
     } finally {
       this.trim(history);

@@ -44,7 +44,12 @@ export class ToolRegistry implements ToolSource {
 
   list(): ToolSpec[] {
     return [...this.serverTools.values(), ...this.deviceTools.values()].map(
-      ({ name, description, parameters }) => ({ name, description, parameters }),
+      ({ name, description, parameters, silent }) => ({
+        name,
+        description,
+        parameters,
+        ...(silent ? { silent } : {}),
+      }),
     );
   }
 

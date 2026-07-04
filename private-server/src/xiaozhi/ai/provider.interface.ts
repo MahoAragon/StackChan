@@ -18,6 +18,14 @@ export interface ToolSpec {
   description: string;
   /** JSON Schema of the arguments object ({type:'object', properties, ...}). */
   parameters: Record<string, unknown>;
+  /**
+   * A "silent" tool ends the user turn with NO spoken reply: once the model
+   * calls it, the provider stops the agent loop instead of running another hop,
+   * so the turn produces no goodbye/acknowledgement text. Used for dismissal
+   * (self.robot.go_to_sleep) — the user asked to be left alone, so the robot
+   * just goes quiet. See LlmProvider.reply.
+   */
+  silent?: boolean;
 }
 
 /**

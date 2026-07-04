@@ -23,6 +23,8 @@ interface ToolTweak {
   injectArgs?: () => Record<string, unknown>;
   /** Rewrite the device's description before the model sees it. */
   fixDescription?: (description: string) => string;
+  /** Mark the tool "silent": calling it ends the turn with no spoken reply. */
+  silent?: boolean;
 }
 
 /**
@@ -54,6 +56,11 @@ const TOOL_TWEAKS: Record<string, ToolTweak> = {
       'neutral. A natural glance stays within +/-45 yaw; use larger values ' +
       'only when asked to turn far or look behind.',
   },
+  // Dismissal is silent: when the user tells the robot to go away, it just goes
+  // quiet and returns to standby — no goodbye, no acknowledgement. The provider
+  // ends the turn the moment this is called (see LangChainLlmProvider.reply),
+  // and the firmware's description tells the model not to speak either.
+  'self.robot.go_to_sleep': { silent: true },
 };
 
 export function buildDeviceTools(
@@ -79,6 +86,7 @@ export function buildDeviceTools(
       parameters: tweak?.hideParams
         ? hideProperties(schema, tweak.hideParams)
         : schema,
+      ...(tweak?.silent ? { silent: true } : {}),
       execute: (args) =>
         mcp.callTool(desc.name, {
           ...coerceArgs(args, desc.inputSchema),
