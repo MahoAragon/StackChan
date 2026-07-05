@@ -97,6 +97,11 @@ export class XiaozhiWsService implements OnModuleDestroy {
 
   private onConnection(socket: WebSocket, req: IncomingMessage) {
     const sessionId = randomUUID();
+    // Kill Nagle: downstream audio is a stream of small (~150-400B) frames,
+    // and coalescing them against the ESP32's delayed ACKs (~250ms in lwIP)
+    // turns the start-of-reply burst into a stall the device hears as a
+    // stutter after the first words.
+    req.socket.setNoDelay(true);
     const remote =
       (req.socket.remoteAddress ?? '?') + ':' + (req.socket.remotePort ?? '?');
     // The firmware sends its MAC as Device-Id on the upgrade request

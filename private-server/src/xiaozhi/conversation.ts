@@ -27,6 +27,13 @@
  * clock: the device renders the text the moment the message arrives, so it is
  * sent when the sentence is projected to be HEARD, not when its audio bytes
  * are sent (which run a prebuffer ahead).
+ *
+ * Two things keep the START of a reply glitch-free on a device that begins
+ * playing the instant its first frame arrives: sentences are synthesized with
+ * one sentence of lookahead (sentence N+1's TTS round-trip overlaps sentence
+ * N's playback — see speakSentences), and the turn's first frames are staged
+ * until TTS_STARTUP_BUFFER_MS of audio is in hand (see dispatchFrame) so the
+ * device starts with a cushion instead of draining a trickle.
  */
 import { Logger } from '@nestjs/common';
 import { WebSocket } from 'ws';
@@ -97,13 +104,43 @@ const VAD_SPEECH_DEBOUNCE_FRAMES = 2;
 const TTS_PREBUFFER_MS = Number(process.env.TTS_PREBUFFER_MS ?? 1200);
 
 /**
+ * Minimum audio staged server-side before a turn's first frame is released
+ * (default: the same cushion the pacer maintains steady-state). The firmware
+ * has no jitter buffer — it starts playing the moment the first frame
+ * arrives — so playback must not start until the opening of the reply can
+ * stream without a hole. A short first sentence alone is never enough: its
+ * audio drains in well under a second while sentence 2 is still in the
+ * LLM+TTS pipeline, heard as a stutter right after the first word or two.
+ * Staging therefore spans sentence boundaries and releases once this much
+ * audio is in hand — or when the reply's audio ends, so a reply shorter
+ * than the cushion is not held at all. The added start latency adapts to
+ * backend speed: it is the time the backends need to produce this much
+ * audio, which is exactly the hole playback would otherwise hit.
+ */
+const TTS_STARTUP_BUFFER_MS = Number(
+  process.env.TTS_STARTUP_BUFFER_MS ?? TTS_PREBUFFER_MS,
+);
+
+/**
  * Pause pacing while more than this many bytes sit unflushed in the socket.
  * Without this, a multi-second TCP stall (WiFi roaming/congestion) would let
  * paced frames pile up in the socket buffer and arrive at the device as one
  * burst on recovery, overflowing its decode queue just like unpaced sending.
- * ~2 KB is a handful of opus frames.
+ *
+ * The value is bounded on both sides. It must exceed one startup burst
+ * (~TTS_PREBUFFER_MS of opus, ~5KB at typical ~240B frames): at 2KB the
+ * burst itself tripped this guard, and with the ESP32's delayed ACKs
+ * (~250ms) holding bufferedAmount up, the guard chopped the burst into 2KB
+ * chunks separated by ~300ms stalls — measured on-device as "Incoming audio
+ * gap: 364ms" and heard as a stutter right after the first words whenever
+ * the opening frames were big (a long first sentence; short openers encode
+ * near-silence frames tiny enough to fit under the old cap). And it must
+ * stay under the device's decode queue capacity (40 packets, ~10KB) so the
+ * recovery burst after a genuine stall cannot overflow it.
  */
-const SOCKET_BACKLOG_LIMIT_BYTES = 2048;
+const SOCKET_BACKLOG_LIMIT_BYTES = Number(
+  process.env.SOCKET_BACKLOG_LIMIT_BYTES ?? 8192,
+);
 const VAD_HANGOVER_FRAMES = Math.max(1, Math.round(VAD_HANGOVER_MS / FRAME_DURATION_MS));
 const MAX_UTTERANCE_FRAMES = Math.max(1, Math.round(MAX_UTTERANCE_MS / FRAME_DURATION_MS));
 const VAD_MIN_SPEECH_FRAMES = 5; // ~300ms of speech before silence may end a turn
@@ -194,6 +231,16 @@ export class ConversationSession {
    * (sent at STT time) animates a silent face for the whole LLM+TTS latency.
    */
   private ttsBracketOpen = false;
+
+  /**
+   * Frames staged before the turn's first send (see TTS_STARTUP_BUFFER_MS);
+   * null once released — later frames flow straight to the pacer. Each entry
+   * keeps its sentence's onSent callback so sentence text scheduled against
+   * playback still anchors correctly however late the release happens.
+   */
+  private startupFrames:
+    | Array<{ packet: Buffer; onSent?: (playsAtMs: number) => void }>
+    | null = null;
 
   /**
    * Emotion sent in the llm frame when this turn's tts bracket opens. Normal
@@ -454,6 +501,7 @@ export class ConversationSession {
     this.codec.resetDownstream();
     this.playbackEndsAtMs = 0;
     this.ttsBracketOpen = false;
+    this.startupFrames = [];
     this.bracketEmotion = 'neutral';
 
     try {
@@ -475,17 +523,15 @@ export class ConversationSession {
       // just-in-time before the first audio frame.
       this.logger.log('Generating reply (LLM -> TTS)...');
 
-      let spokeAnything = false;
-      for await (const sentence of this.sentences(
-        this.providers.llm.reply(this.sessionId, userText, this.tools, () =>
-          this.isStale(turn),
+      const spokeAnything = await this.speakSentences(
+        this.sentences(
+          this.providers.llm.reply(this.sessionId, userText, this.tools, () =>
+            this.isStale(turn),
+          ),
         ),
-      )) {
-        if (this.isStale(turn)) return;
-        spokeAnything = true;
-        await this.speakSentence(sentence, turn);
-        if (this.isStale(turn)) return;
-      }
+        turn,
+      );
+      if (this.isStale(turn)) return;
       if (!spokeAnything) this.logger.log('LLM produced no reply text');
       else {
         // Hold the tts stop until the buffered tail (~TTS_PREBUFFER_MS) has
@@ -597,16 +643,16 @@ export class ConversationSession {
     this.codec.resetDownstream();
     this.playbackEndsAtMs = 0;
     this.ttsBracketOpen = false;
+    // Sounds bypass the startup stage: their PCM is already in hand, so the
+    // whole prebuffer bursts out at once and a cushion forms on its own.
+    this.startupFrames = event.kind === 'say' ? [] : null;
     this.bracketEmotion =
       event.kind === 'say' ? (event.emotion ?? 'neutral') : null;
 
     let outcome: ServerEventResult = 'completed';
     try {
       if (event.kind === 'say') {
-        for (const sentence of splitIntoSentences(event.text)) {
-          if (this.isStale(turn)) break;
-          await this.speakSentence(sentence, turn);
-        }
+        await this.speakSentences(splitIntoSentences(event.text), turn);
       } else {
         // Encode incrementally, a chunk ahead of the paced sends — encoding
         // a long WAV in one synchronous pass would block the event loop for
@@ -652,39 +698,189 @@ export class ConversationSession {
   }
 
   /**
-   * Synthesize one sentence and stream its opus frames downstream. The
-   * sentence_start text is scheduled for the projected playback start of the
-   * sentence's first frame — NOT sent when the audio bytes are: frames run up
-   * to TTS_PREBUFFER_MS ahead of the speaker, and the device renders the text
-   * on receipt, so sending eagerly flashes sentence N+1 on screen while
-   * sentence N is still being spoken.
+   * Speak a stream of sentences with one sentence of TTS lookahead: while
+   * sentence N's frames are paced out in real time, sentence N+1 is already
+   * being pulled from the source and synthesized. Strictly sequential
+   * round-trips — finish sending N, then start N+1's synthesis — would land
+   * the whole TTS latency as dead air at every sentence boundary; the device
+   * has no jitter buffer, so after a short opening sentence that was heard
+   * as a stutter right after the first word or two. Returns true if at least
+   * one sentence was spoken.
    */
-  private async speakSentence(sentence: string, turn: number): Promise<void> {
+  private async speakSentences(
+    source: AsyncIterable<string> | Iterable<string>,
+    turn: number,
+  ): Promise<boolean> {
+    const iter = (async function* () {
+      yield* source;
+    })();
+    let spoke = false;
+    let current = await iter.next();
+    let audio = current.done ? null : this.prefetchTts(current.value, turn);
+    while (!current.done && audio) {
+      if (this.isStale(turn)) break;
+      spoke = true;
+      // Pull the next sentence and start its synthesis NOW, before this
+      // sentence's real-time send below. The extra catch keeps an LLM stream
+      // error from surfacing as an unhandled rejection when we bail before
+      // the await; awaiting upNext still rethrows it.
+      const upNext = iter.next().then((next) => ({
+        next,
+        audio:
+          next.done || this.isStale(turn)
+            ? null
+            : this.prefetchTts(next.value, turn),
+      }));
+      void upNext.catch(() => undefined);
+      await this.speakSentence(current.value, audio, turn);
+      if (this.isStale(turn)) break;
+      const prepared = await upNext;
+      current = prepared.next;
+      audio = prepared.audio;
+    }
+    // A reply shorter than the startup cushion never crossed the release
+    // threshold — send it now that there is nothing left to wait for.
+    if (!this.isStale(turn)) await this.releaseStartupFrames(turn);
+    return spoke;
+  }
+
+  /**
+   * Start a sentence's TTS immediately and buffer its PCM as it streams in,
+   * returning a replayable iterable the send loop consumes later. This is
+   * what makes the lookahead in speakSentences real: creating it fires the
+   * synthesis request now, so sentence N+1 renders while sentence N is still
+   * playing. The pump stops pulling once the turn goes stale; a synthesis
+   * error is rethrown to the consumer (or dropped if never consumed).
+   */
+  private prefetchTts(sentence: string, turn: number): AsyncIterable<Buffer> {
+    const chunks: Buffer[] = [];
+    let done = false;
+    let failed = false;
+    let failure: unknown = null;
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      wake?.();
+      wake = null;
+    };
+    void (async () => {
+      try {
+        for await (const chunk of this.providers.tts.synthesize(sentence)) {
+          chunks.push(chunk);
+          notify();
+          if (this.isStale(turn)) break;
+        }
+      } catch (err) {
+        failed = true;
+        failure = err;
+      } finally {
+        done = true;
+        notify();
+      }
+    })();
+    return (async function* () {
+      for (let i = 0; ; ) {
+        if (i < chunks.length) {
+          yield chunks[i++];
+        } else if (done) {
+          if (failed) throw failure;
+          return;
+        } else {
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      }
+    })();
+  }
+
+  /**
+   * Stream one sentence's synthesized audio downstream as paced opus frames.
+   * The sentence_start text is scheduled for the projected playback start of
+   * the sentence's first frame — NOT sent when the audio bytes are: frames
+   * run up to TTS_PREBUFFER_MS ahead of the speaker, and the device renders
+   * the text on receipt, so sending eagerly flashes sentence N+1 on screen
+   * while sentence N is still being spoken.
+   */
+  private async speakSentence(
+    sentence: string,
+    audio: AsyncIterable<Buffer>,
+    turn: number,
+  ): Promise<void> {
     let announced = false;
+    let produced = false;
     const announceAt = (playsAtMs: number): void => {
       announced = true;
       this.sendAtPlaybackTime(buildTtsSentenceStart(sentence, this.sessionId), playsAtMs, turn);
     };
-    for await (const pcmChunk of this.providers.tts.synthesize(sentence)) {
+    // Fires when a frame of this sentence is actually SENT — immediately on
+    // the direct path, or at startup release for staged frames, so the text
+    // anchors to real playback however long the frames sat staged.
+    const onSent = (playsAtMs: number): void => {
+      if (!announced) announceAt(playsAtMs);
+    };
+    for await (const pcmChunk of audio) {
       if (this.isStale(turn)) return;
       for (const packet of this.codec.encodeDownstreamPcm(pcmChunk)) {
         if (this.isStale(turn)) return;
-        const playsAtMs = await this.sendAudioFramePaced(packet, turn);
-        if (!announced && playsAtMs !== null) announceAt(playsAtMs);
+        produced = true;
+        await this.dispatchFrame(packet, turn, onSent);
       }
     }
     // Emit this sentence's trailing partial frame so nothing is dropped and the
     // next sentence starts on a clean frame boundary.
     if (this.isStale(turn)) return;
     for (const packet of this.codec.flushDownstream()) {
-      const playsAtMs = await this.sendAudioFramePaced(packet, turn);
-      if (!announced && playsAtMs !== null) announceAt(playsAtMs);
+      produced = true;
+      await this.dispatchFrame(packet, turn, onSent);
     }
     // A sentence whose TTS yielded no audio still gets its text, once any
     // buffered audio before it has played out. Scheduled 1ms inside the
     // end-of-turn drain so the turn-closing turnId bump can't cancel it on an
-    // exact timer tie.
-    if (!announced && !this.isStale(turn)) announceAt(this.playbackEndsAtMs - 1);
+    // exact timer tie. (A sentence whose frames are merely still staged is
+    // NOT announced here — its onSent fires when the frames release.)
+    if (!produced && !announced && !this.isStale(turn)) {
+      announceAt(this.playbackEndsAtMs - 1);
+    }
+  }
+
+  /**
+   * Route one encoded frame to the pacer, or stage it while the turn's
+   * startup cushion (TTS_STARTUP_BUFFER_MS) is still filling. `onSent` fires
+   * with the frame's projected playback start once it is actually sent —
+   * possibly much later than this call, if the frame was staged.
+   */
+  private async dispatchFrame(
+    packet: Buffer,
+    turn: number,
+    onSent?: (playsAtMs: number) => void,
+  ): Promise<void> {
+    if (this.startupFrames) {
+      this.startupFrames.push({ packet, onSent });
+      if (this.startupFrames.length * FRAME_DURATION_MS >= TTS_STARTUP_BUFFER_MS) {
+        await this.releaseStartupFrames(turn);
+      }
+      return;
+    }
+    const playsAtMs = await this.sendAudioFramePaced(packet, turn);
+    if (playsAtMs !== null) onSent?.(playsAtMs);
+  }
+
+  /**
+   * Send all staged startup frames and disarm staging for the rest of the
+   * turn: from here on the pacer's rolling prebuffer carries the cushion.
+   * The release arrives at the device as one burst (the pacer lets the
+   * first TTS_PREBUFFER_MS through instantly), so playback starts with the
+   * whole cushion already in hand.
+   */
+  private async releaseStartupFrames(turn: number): Promise<void> {
+    if (!this.startupFrames) return;
+    const staged = this.startupFrames;
+    this.startupFrames = null;
+    for (const { packet, onSent } of staged) {
+      const playsAtMs = await this.sendAudioFramePaced(packet, turn);
+      if (playsAtMs === null) return;
+      onSent?.(playsAtMs);
+    }
   }
 
   /**
